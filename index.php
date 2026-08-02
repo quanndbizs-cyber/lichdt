@@ -44,7 +44,7 @@ foreach ($registrations as $r) {
         body { font-family: Arial, sans-serif; background-color: #fcf8ec; margin: 0; padding: 15px; font-size: 20px; color: #333; }
         .container { max-width: 600px; margin: 0 auto; background: #fff; padding: 20px; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); border: 2px solid #e0a96d; }
         h2, h3 { text-align: center; color: #8b0000; margin-top: 5px; }
-        .announcement { background-color: #fff8e7; padding: 15px; border-left: 5px solid #d4af37; font-size: 18px; line-height: 1.6; margin-bottom: 20px; border-radius: 4px; }
+        .announcement { background-color: #fff8e7; padding: 15px; border-left: 5px solid #d4af37; font-size: 18px; line-height: 1.6; margin-bottom: 20px; border-radius: 4px; white-space: pre-line; }
         label { font-weight: bold; display: block; margin-bottom: 8px; color: #8b0000; }
         input[type="text"] { width: 100%; padding: 15px; font-size: 22px; border: 2px solid #ccc; border-radius: 8px; box-sizing: border-box; margin-bottom: 20px; }
         .btn { width: 100%; padding: 18px; font-size: 22px; font-weight: bold; color: #fff; border: none; border-radius: 10px; margin-bottom: 15px; cursor: pointer; text-align: center; }
@@ -63,10 +63,11 @@ foreach ($registrations as $r) {
 <div class="container">
     <h2>Trợ Duyên Niệm Phật</h2>
     
-    <div class="announcement">
-        <b>Nam Mô A Di Đà Phật</b><br>
-        [cite_start]Đạo tràng tổ chức trợ duyên cho bác X. Do nhà chật, mỗi ca ưu tiên khoảng <b>10 người</b>[cite: 3, 26, 27]. [cite_start]Kính mong quý liên hữu chọn ca phù hợp bên dưới: [cite: 26, 27]
-    </div>
+    <div class="announcement">Nam Mô A Di Đà Phật
+
+kính thưa THẦY và liên hữu đồng tu bác X yếu nên đạo tràng tổ chức trợ duyên cho bác ngày 2 thời chiều 2h15' tối 7h15'các bác đủ duyên thời nào mong các bác hoan hỷ vì nhà bác X chật nên mỗi ca khoảng tầm 10 người và còn gia đình cũng đông ,các bác hoan hỷ cùng tham gia ,con xin thành kính tri ân cđ của quí Thầy cùng liên hữu đồng tu ạ
+
+Nam Mô A Di Đà Phật</div>
 
     <?php if (!empty($message)): ?>
         <div class="alert"><?= $message ?></div>
