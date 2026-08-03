@@ -1,7 +1,7 @@
 <?php
 /**
  * HỆ THỐNG SẮP LỊCH TRỢ DUYÊN NIỆM PHẬT - BAN HỘ NIỆM / TRỢ NIỆM
- * Phiên bản: 2.0 Complete (Đáp ứng 100% Yêu cầu Nghiên cứu & Bảo trì)
+ * Phiên bản: 2.1 - Linh hoạt điều chỉnh số lượng ưu tiên từng Ca & Đợt
  * Triết lý thiết kế: High-Touch, Low-Tech (Tối giản 1-chạm, chữ to, không cần đăng nhập)
  * Lưu trữ: SQLite (database.sqlite)
  */
@@ -12,11 +12,13 @@ try {
     $pdo = new PDO("sqlite:" . $dbFile);
     $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
     $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+    // Tối ưu hóa ghi đồng thời bằng chế độ Write-Ahead Logging (WAL)
+    $pdo->exec("PRAGMA journal_mode = WAL;");
 } catch (PDOException $e) {
     die("Lỗi kết nối CSDL SQLite: " . $e->getMessage());
 }
 
-// Tự động khởi tạo cấu trúc Bảng CSDL nếu chưa có
+// Tự động khởi tạo cấu trúc 4 Bảng CSDL nếu chưa tồn tại
 $pdo->exec("
     CREATE TABLE IF NOT EXISTS events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -55,17 +57,17 @@ $pdo->exec("
     );
 ");
 
-// Hàm ghi Nhật ký Hệ thống (Logs)
+// Hàm ghi Nhật ký Hệ thống (Audit Trail)
 function logAction($pdo, $action, $details = '') {
     try {
         $stmt = $pdo->prepare("INSERT INTO logs (action, details) VALUES (?, ?)");
         $stmt->execute([$action, $details]);
     } catch (Exception $e) {
-        // Bỏ qua lỗi ghi log nếu có
+        // Bỏ qua lỗi nếu gặp trục trặc ghi log
     }
 }
 
-// Chèn dữ liệu mẫu nếu DB hoàn toàn trống
+// Chèn dữ liệu khởi tạo mẫu nếu DB hoàn toàn trống
 $stmtCheck = $pdo->query("SELECT COUNT(*) as cnt FROM events");
 if ($stmtCheck->fetch()['cnt'] == 0) {
     $pdo->exec("INSERT INTO events (patient_name, address, note, status) VALUES 
@@ -75,17 +77,17 @@ if ($stmtCheck->fetch()['cnt'] == 0) {
     $pdo->exec("INSERT INTO shifts (event_id, shift_name, shift_time, max_target, shift_date) VALUES 
         ($eventId, 'Ca Chiều', '14h15\'', 10, '$today'),
         ($eventId, 'Ca Tối', '19h15\'', 10, '$today')");
-    logAction($pdo, 'INIT_DATABASE', 'Khởi tạo dữ liệu mẫu thành công');
+    logAction($pdo, 'INIT_DATABASE', 'Khởi tạo dữ liệu đợt trợ duyên mẫu thành công');
 }
 
-// 2. XỬ LÝ ACTION TỪ FORM (POST)
+// 2. XỬ LÝ HÀNH ĐỘNG TỪ FORM (POST)
 $flashMessage = '';
 $flashType = 'success';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $action = $_POST['action'] ?? '';
 
-    // Đăng ký ca trợ duyên
+    // Đăng ký ca trợ duyên (1-Click cho Phật tử)
     if ($action === 'register') {
         $shiftId = intval($_POST['shift_id'] ?? 0);
         $fullname = trim($_POST['fullname'] ?? '');
@@ -94,7 +96,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if (!empty($fullname) && $shiftId > 0) {
             $stmt = $pdo->prepare("INSERT INTO registrations (shift_id, fullname, role_type) VALUES (?, ?, ?)");
             $stmt->execute([$shiftId, $fullname, $roleType]);
-            logAction($pdo, 'REGISTER', "Phật tử $fullname đăng ký ca ID $shiftId ($roleType)");
+            logAction($pdo, 'REGISTER', "Phật tử $fullname đăng ký Ca ID $shiftId ($roleType)");
             $flashMessage = "A Di Đà Phật! Đã ghi nhận Phật tử [ " . htmlspecialchars($fullname) . " ] đăng ký thành công.";
         } else {
             $flashMessage = "Vui lòng nhập Họ và Tên trước khi chọn ca.";
@@ -102,7 +104,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     }
 
-    // Hủy đăng ký
+    // Hủy lượt đăng ký
     if ($action === 'cancel_registration') {
         $regId = intval($_POST['reg_id'] ?? 0);
         if ($regId > 0) {
@@ -117,32 +119,37 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     }
 
-    // Admin: Tạo sự kiện mới
+    // Admin: Tạo đợt trợ duyên mới hoàn toàn (Cho phép đặt chỉ tiêu riêng từng ca)
     if ($action === 'create_event') {
         $patientName = trim($_POST['patient_name'] ?? '');
         $address = trim($_POST['address'] ?? '');
         $note = trim($_POST['note'] ?? '');
         $afternoonTime = trim($_POST['afternoon_time'] ?? '14h15\'');
+        $afternoonTarget = intval($_POST['afternoon_target'] ?? 10);
         $eveningTime = trim($_POST['evening_time'] ?? '19h15\'');
+        $eveningTarget = intval($_POST['evening_target'] ?? 10);
         
         if (!empty($patientName)) {
+            // Lưu đợt cũ thành hoàn thành
             $pdo->exec("UPDATE events SET status = 'completed' WHERE status = 'active'");
             
+            // Tạo đợt mới
             $stmt = $pdo->prepare("INSERT INTO events (patient_name, address, note, status) VALUES (?, ?, ?, 'active')");
             $stmt->execute([$patientName, $address, $note]);
             $newEventId = $pdo->lastInsertId();
             
+            // Tạo 2 ca mặc định kèm số lượng ưu tiên tùy chỉnh
             $today = date('Y-m-d');
-            $stmtShift = $pdo->prepare("INSERT INTO shifts (event_id, shift_name, shift_time, max_target, shift_date) VALUES (?, ?, ?, 10, ?)");
-            $stmtShift->execute([$newEventId, 'Ca Chiều', $afternoonTime, $today]);
-            $stmtShift->execute([$newEventId, 'Ca Tối', $eveningTime, $today]);
+            $stmtShift = $pdo->prepare("INSERT INTO shifts (event_id, shift_name, shift_time, max_target, shift_date) VALUES (?, ?, ?, ?, ?)");
+            $stmtShift->execute([$newEventId, 'Ca Chiều', $afternoonTime, $afternoonTarget, $today]);
+            $stmtShift->execute([$newEventId, 'Ca Tối', $eveningTime, $eveningTarget, $today]);
             
-            logAction($pdo, 'CREATE_EVENT', "Tạo đợt trợ duyên mới: $patientName");
+            logAction($pdo, 'CREATE_EVENT', "Tạo đợt trợ duyên mới: $patientName (Chỉ tiêu Chiều: $afternoonTarget, Tối: $eveningTarget)");
             $flashMessage = "A Di Đà Phật! Đã khởi tạo đợt trợ duyên mới cho " . htmlspecialchars($patientName);
         }
     }
 
-    // Admin: Cập nhật thông tin sự kiện & Thời gian các ca (Thay đổi lịch linh hoạt)
+    // Admin: Cập nhật thông tin đợt trợ duyên & Điều chỉnh giờ/chỉ tiêu ưu tiên từng Ca
     if ($action === 'update_event') {
         $eventId = intval($_POST['event_id'] ?? 0);
         $patientName = trim($_POST['patient_name'] ?? '');
@@ -153,35 +160,50 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $stmt = $pdo->prepare("UPDATE events SET patient_name = ?, address = ?, note = ? WHERE id = ?");
             $stmt->execute([$patientName, $address, $note, $eventId]);
 
-            // Cập nhật giờ ca nếu có
+            // Cập nhật giờ và số lượng ưu tiên của từng Ca
             if (isset($_POST['shift_times']) && is_array($_POST['shift_times'])) {
                 foreach ($_POST['shift_times'] as $shiftId => $sTime) {
-                    $stmtS = $pdo->prepare("UPDATE shifts SET shift_time = ? WHERE id = ? AND event_id = ?");
-                    $stmtS->execute([trim($sTime), intval($shiftId), $eventId]);
+                    $sTarget = intval($_POST['shift_targets'][$shiftId] ?? 10);
+                    if ($sTarget <= 0) $sTarget = 10;
+                    
+                    $stmtS = $pdo->prepare("UPDATE shifts SET shift_time = ?, max_target = ? WHERE id = ? AND event_id = ?");
+                    $stmtS->execute([trim($sTime), $sTarget, intval($shiftId), $eventId]);
                 }
             }
             
-            logAction($pdo, 'UPDATE_EVENT', "Cập nhật thông tin/lịch ca đợt ID $eventId");
-            $flashMessage = "A Di Đà Phật! Đã cập nhật thành công thông tin & thời gian ca trợ duyên.";
+            logAction($pdo, 'UPDATE_EVENT', "Cập nhật thông tin & điều chỉnh chỉ tiêu các ca đợt ID $eventId");
+            $flashMessage = "A Di Đà Phật! Đã cập nhật thành công thông tin & số lượng ưu tiên cho các ca.";
         }
     }
 
-    // Admin: Thêm ca trợ duyên đột xuất (Ví dụ: Ca Sáng, Ca Đột Xuất)
+    // Admin: Thêm ca trợ duyên mới (Tuỳ chỉnh Tên ca, Giờ ca, Số lượng ưu tiên)
     if ($action === 'add_custom_shift') {
         $eventId = intval($_POST['event_id'] ?? 0);
         $shiftName = trim($_POST['shift_name'] ?? '');
         $shiftTime = trim($_POST['shift_time'] ?? '');
         $maxTarget = intval($_POST['max_target'] ?? 10);
+        if ($maxTarget <= 0) $maxTarget = 10;
         
         if ($eventId > 0 && !empty($shiftName) && !empty($shiftTime)) {
             $stmt = $pdo->prepare("INSERT INTO shifts (event_id, shift_name, shift_time, max_target, shift_date) VALUES (?, ?, ?, ?, ?)");
             $stmt->execute([$eventId, $shiftName, $shiftTime, $maxTarget, date('Y-m-d')]);
-            logAction($pdo, 'ADD_SHIFT', "Thêm ca mới [$shiftName - $shiftTime] vào đợt ID $eventId");
-            $flashMessage = "Đã thêm ca trợ duyên mới thành công.";
+            logAction($pdo, 'ADD_SHIFT', "Thêm ca mới [$shiftName - $shiftTime - Chỉ tiêu: $maxTarget vị] vào đợt ID $eventId");
+            $flashMessage = "Đã thêm ca trợ duyên mới thành công với chỉ tiêu $maxTarget vị.";
         }
     }
 
-    // Admin: Hoàn thành sự kiện
+    // Admin: Xóa 1 ca trợ duyên
+    if ($action === 'delete_shift') {
+        $shiftId = intval($_POST['shift_id'] ?? 0);
+        if ($shiftId > 0) {
+            $stmt = $pdo->prepare("DELETE FROM shifts WHERE id = ?");
+            $stmt->execute([$shiftId]);
+            logAction($pdo, 'DELETE_SHIFT', "Xóa Ca ID $shiftId");
+            $flashMessage = "Đã xóa ca trợ duyên.";
+        }
+    }
+
+    // Admin: Đánh dấu hoàn thành đợt trợ duyên
     if ($action === 'complete_event') {
         $eventId = intval($_POST['event_id'] ?? 0);
         if ($eventId > 0) {
@@ -226,7 +248,7 @@ if ($activeEvent) {
     }
 }
 
-// Lấy danh sách thống kê tổng số lượt tham gia của từng Phật tử
+// Bảng Thống Kê Dữ Liệu Dài Hạn
 $memberStats = [];
 if ($mode === 'stats' || $mode === 'admin') {
     $stmtStats = $pdo->query("
@@ -242,36 +264,36 @@ if ($mode === 'stats' || $mode === 'admin') {
 $testResults = [];
 if ($mode === 'test') {
     try {
-        // Test 1: SQLite Connection
-        $testResults[] = ["test" => "Kiểm tra kết nối SQLite PDO", "status" => true, "msg" => "Kết nối thành công database.sqlite"];
+        // Test 1: Kết nối SQLite
+        $testResults[] = ["test" => "Kiểm tra kết nối SQLite PDO (WAL Mode)", "status" => true, "msg" => "Kết nối thành công database.sqlite"];
         
-        // Test 2: Ghi nhận logs
-        logAction($pdo, 'TEST_RUNNER', 'Chạy tự động Unit Test');
+        // Test 2: Ghi nhật ký logs
+        logAction($pdo, 'TEST_RUNNER', 'Chạy kiểm thử tự động hệ thống');
         $stmtLogCheck = $pdo->query("SELECT COUNT(*) as cnt FROM logs WHERE action = 'TEST_RUNNER'");
-        $testResults[] = ["test" => "Ghi nhật ký hệ thống (Logs Table)", "status" => $stmtLogCheck->fetch()['cnt'] > 0, "msg" => "Ghi log thao tác thành công"];
+        $testResults[] = ["test" => "Ghi Nhật ký Hệ thống (Logs Table)", "status" => $stmtLogCheck->fetch()['cnt'] > 0, "msg" => "Ghi log thao tác thành công"];
 
-        // Test 3: Insert dummy registration
+        // Test 3: Thêm lượt đăng ký kiểm thử
         if (!empty($shifts)) {
             $testShiftId = $shifts[0]['id'];
-            $pdo->prepare("INSERT INTO registrations (shift_id, fullname, role_type) VALUES (?, ?, ?)")->execute([$testShiftId, "Test_Phật_Tử_Kiểm_Thử", "Thành viên"]);
+            $pdo->prepare("INSERT INTO registrations (shift_id, fullname, role_type) VALUES (?, ?, ?)")->execute([$testShiftId, "Phật_Tử_Kiểm_Thử_Test", "Thành viên"]);
             $dummyId = $pdo->lastInsertId();
             $testResults[] = ["test" => "Thêm lượt đăng ký giả lập", "status" => true, "msg" => "Chèn ID: $dummyId thành công"];
             
-            // Test 4: Delete dummy registration
+            // Test 4: Xóa lượt đăng ký kiểm thử
             $pdo->prepare("DELETE FROM registrations WHERE id = ?")->execute([$dummyId]);
             $testResults[] = ["test" => "Xóa lượt đăng ký kiểm thử", "status" => true, "msg" => "Xóa dữ liệu test thành công"];
         }
         
-        // Test 5: Query all 4 tables
+        // Test 5: Kiểm tra cấu trúc 4 Bảng
         $tables = $pdo->query("SELECT name FROM sqlite_master WHERE type='table'")->fetchAll(PDO::FETCH_COLUMN);
         $has4Tables = in_array('events', $tables) && in_array('shifts', $tables) && in_array('registrations', $tables) && in_array('logs', $tables);
-        $testResults[] = ["test" => "Cấu trúc 4 Bảng CSDL SQLite", "status" => $has4Tables, "msg" => "Tìm thấy các bảng: " . implode(", ", $tables)];
+        $testResults[] = ["test" => "Cấu trúc 4 Bảng CSDL SQLite", "status" => $has4Tables, "msg" => "Các bảng hiện tại: " . implode(", ", $tables)];
     } catch (Exception $ex) {
         $testResults[] = ["test" => "Lỗi Kiểm Thử", "status" => false, "msg" => $ex->getMessage()];
     }
 }
 
-// Đơn vị đường dẫn hiện tại
+// Tạo URL cố định cho 1-Link duy nhất
 $protocol = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? "https" : "http";
 $currentUrl = $protocol . "://" . $_SERVER['HTTP_HOST'] . strtok($_SERVER["REQUEST_URI"], '?');
 if ($activeEvent) {
@@ -294,12 +316,12 @@ if ($activeEvent) {
 </head>
 <body class="bg-amber-50 text-slate-800 min-h-screen pb-12">
 
-    <!-- Header Trang -->
+    <!-- Header Cố Định -->
     <header class="bg-amber-700 text-amber-50 shadow-md py-3.5 px-4 sticky top-0 z-50">
         <div class="max-w-xl mx-auto flex justify-between items-center">
             <div>
                 <h1 class="text-lg sm:text-xl font-bold tracking-wide">NAM MÔ A DI ĐÀ PHẬT</h1>
-                <p class="text-xs text-amber-200">Ban Hộ Niệm / Trợ Niệm Phật Giáo</p>
+                <p class="text-xs text-amber-200">Đạo Tràng Trợ Duyên Niệm Phật</p>
             </div>
             <div class="flex items-center gap-1 text-xs sm:text-sm font-medium">
                 <a href="?mode=public<?php echo $activeEvent ? '&event_id='.$activeEvent['id'] : ''; ?>" class="px-2.5 py-1.5 rounded <?php echo $mode==='public'?'bg-amber-900 text-white':'bg-amber-800/60 hover:bg-amber-800'; ?>">Trợ Duyên</a>
@@ -323,14 +345,14 @@ if ($activeEvent) {
             <?php if ($activeEvent): ?>
                 <div class="bg-white rounded-2xl p-5 shadow-sm border border-amber-200/80 mb-5">
                     <div class="inline-block px-3 py-1 bg-amber-100 text-amber-800 text-xs font-semibold rounded-full mb-2">
-                        Thời gian này đang trợ duyên
+                        Đợt này đang trợ duyên
                     </div>
                     <h2 class="text-2xl font-bold text-amber-900 mb-1">Trợ duyên: <?php echo htmlspecialchars($activeEvent['patient_name']); ?></h2>
                     <p class="text-slate-600 text-elder font-medium mb-2">📍 Địa chỉ: <?php echo htmlspecialchars($activeEvent['address']); ?></p>
                     
                     <div class="p-3.5 bg-amber-50/90 rounded-xl border border-amber-200 text-slate-700 text-base leading-relaxed my-2">
                         <strong class="text-amber-900">Lời dặn Ban Điều Hành:</strong><br>
-                        "<?php echo htmlspecialchars($activeEvent['note'] ?: "Nam Mô A Di Đà Phật. Kính thưa THẦY và liên hữu đồng tu: {$activeEvent['patient_name']} yếu nên đạo tràng tổ chức trợ duyên ngày 2 thời. Kính mong quý liên hữu hoan hỷ đăng ký tham gia tùy duyên."); ?>"
+                        "<?php echo htmlspecialchars($activeEvent['note'] ?: "Nam Mô A Di Đà Phật. Kính thưa THẦY và liên hữu đồng tu: {$activeEvent['patient_name']} yếu nên đạo tràng tổ chức trợ duyên. Kính mong quý liên hữu hoan hỷ đăng ký tham gia tùy duyên."); ?>"
                     </div>
                 </div>
 
@@ -366,6 +388,7 @@ if ($activeEvent) {
                             <?php foreach ($shifts as $s): ?>
                                 <?php 
                                     $count = count($registrationsByShift[$s['id']] ?? []);
+                                    $target = $s['max_target'] ?? 10;
                                     $sNameLower = mb_strtolower($s['shift_name']);
                                     $isAfternoon = strpos($sNameLower, 'chiều') !== false;
                                     $isEvening = strpos($sNameLower, 'tối') !== false;
@@ -378,9 +401,12 @@ if ($activeEvent) {
                                         $btnColor = 'bg-emerald-600 hover:bg-emerald-700 text-white';
                                     }
                                 ?>
-                                <button type="button" onclick="submitRegister(<?php echo $s['id']; ?>)" class="btn-touch w-full <?php echo $btnColor; ?> font-bold rounded-xl shadow-md flex justify-between items-center px-5 transition-transform active:scale-95">
-                                    <span><?php echo htmlspecialchars($s['shift_name']); ?> (<?php echo htmlspecialchars($s['shift_time']); ?>)</span>
-                                    <span class="text-sm bg-white/20 px-3 py-1 rounded-full font-normal">Đã có <?php echo $count; ?> vị</span>
+                                <button type="button" onclick="submitRegister(<?php echo $s['id']; ?>)" class="btn-touch w-full <?php echo $btnColor; ?> font-bold rounded-xl shadow-md flex justify-between items-center px-4 transition-transform active:scale-95">
+                                    <div class="text-left">
+                                        <div><?php echo htmlspecialchars($s['shift_name']); ?> (<?php echo htmlspecialchars($s['shift_time']); ?>)</div>
+                                        <div class="text-xs font-normal opacity-90">Ưu tiên ~<?php echo $target; ?> vị</div>
+                                    </div>
+                                    <span class="text-sm bg-white/20 px-3 py-1.5 rounded-full font-semibold">Đã có <?php echo $count; ?> vị</span>
                                 </button>
                             <?php endforeach; ?>
                         </div>
@@ -393,7 +419,7 @@ if ($activeEvent) {
                         <?php 
                             $regs = $registrationsByShift[$s['id']] ?? [];
                             $count = count($regs);
-                            $max = $s['max_target'];
+                            $max = $s['max_target'] ?? 10;
                             $sNameLower = mb_strtolower($s['shift_name']);
                             $isAfternoon = strpos($sNameLower, 'chiều') !== false;
                             $headerBg = $isAfternoon ? 'bg-amber-100 text-amber-900 border-amber-300' : 'bg-indigo-100 text-indigo-900 border-indigo-300';
@@ -411,7 +437,7 @@ if ($activeEvent) {
                             <div class="p-4">
                                 <?php if ($count >= $max): ?>
                                     <p class="text-sm text-amber-800 bg-amber-50 p-2.5 rounded-lg border border-amber-200 mb-3">
-                                        🌸 Ca đã đủ chỉ tiêu <?php echo $max; ?> vị. Quý liên hữu tùy duyên đăng ký thêm nếu thuận tiện!
+                                        🌸 Ca đã đủ chỉ tiêu ưu tiên <?php echo $max; ?> vị. Quý liên hữu hoan hỷ tùy duyên đăng ký thêm nếu thuận tiện!
                                     </p>
                                 <?php endif; ?>
 
@@ -453,10 +479,10 @@ if ($activeEvent) {
             <!-- GIAO DIỆN QUẢN TRỊ (ADMIN DASHBOARD) -->
             <div class="space-y-6">
                 
-                <!-- CHỈNH SỬA / CẬP NHẬT ĐỢT TRỢ DUYÊN HIỆN TẠI (THAY ĐỔI LINH HOẠT) -->
+                <!-- CẬP NHẬT ĐỢT ĐANG TRỢ DUYÊN & ĐIỀU CHỈNH CHỈ TIÊU TỪNG CA -->
                 <?php if ($activeEvent): ?>
                     <div class="bg-white rounded-2xl p-5 shadow-sm border border-amber-300 bg-amber-50/20">
-                        <h2 class="text-xl font-bold text-amber-900 mb-3 pb-2 border-b">✏️ Cập Nhật Đợt Đang Trợ Duyên (Thay Đổi Giờ / Ghi Chú)</h2>
+                        <h2 class="text-xl font-bold text-amber-900 mb-3 pb-2 border-b">✏️ Điều Chỉnh Lịch & Chỉ Tiêu Từng Ca (Đợt Hiện Tại)</h2>
                         <form method="POST" class="space-y-3">
                             <input type="hidden" name="action" value="update_event">
                             <input type="hidden" name="event_id" value="<?php echo $activeEvent['id']; ?>">
@@ -477,37 +503,47 @@ if ($activeEvent) {
                             </div>
 
                             <div class="border-t pt-3 mt-2">
-                                <label class="block text-xs font-bold text-slate-700 mb-2">Đổi Giờ Các Ca Hiện Tại (Giữ Nguyên Danh Sách Đã Đăng Ký):</label>
-                                <div class="grid grid-cols-2 gap-2">
+                                <label class="block text-xs font-bold text-slate-700 mb-2">Đổi Giờ & Điều Chỉnh Số Lượng Ưu Tiên Cho Từng Ca:</label>
+                                <div class="space-y-3">
                                     <?php foreach ($shifts as $s): ?>
-                                        <div>
-                                            <label class="block text-xs text-slate-500 mb-1"><?php echo htmlspecialchars($s['shift_name']); ?>:</label>
-                                            <input type="text" name="shift_times[<?php echo $s['id']; ?>]" value="<?php echo htmlspecialchars($s['shift_time']); ?>" class="w-full p-2 border rounded-lg text-center font-semibold">
+                                        <div class="p-3 bg-white rounded-xl border flex items-center justify-between gap-2">
+                                            <div class="font-bold text-sm text-slate-800 w-1/4">
+                                                <?php echo htmlspecialchars($s['shift_name']); ?>
+                                            </div>
+                                            <div class="w-2/5">
+                                                <label class="block text-[10px] text-slate-400">Giờ ca:</label>
+                                                <input type="text" name="shift_times[<?php echo $s['id']; ?>]" value="<?php echo htmlspecialchars($s['shift_time']); ?>" class="w-full p-1.5 border rounded text-center text-sm font-semibold">
+                                            </div>
+                                            <div class="w-1/3">
+                                                <label class="block text-[10px] text-amber-700 font-semibold">Chỉ tiêu (vị):</label>
+                                                <input type="number" min="1" max="50" name="shift_targets[<?php echo $s['id']; ?>]" value="<?php echo $s['max_target'] ?? 10; ?>" class="w-full p-1.5 border rounded text-center text-sm font-bold text-amber-800 bg-amber-50">
+                                            </div>
                                         </div>
                                     <?php endforeach; ?>
                                 </div>
                             </div>
 
                             <button type="submit" class="w-full py-2.5 bg-amber-600 hover:bg-amber-700 text-white font-bold rounded-xl mt-2 text-sm shadow">
-                                💾 Cập Nhật Thông Tin & Lịch Trực
+                                💾 Cập Nhật Thông Tin & Chỉ Tiêu Từng Ca
                             </button>
                         </form>
                     </div>
 
-                    <!-- THÊM CA ĐỘT XUẤT -->
+                    <!-- THÊM CA ĐỘT XUẤT TÙY CHỈNH CHỈ TIÊU -->
                     <div class="bg-white rounded-2xl p-5 shadow-sm border border-slate-200">
-                        <h2 class="text-lg font-bold text-slate-900 mb-3">➕ Thêm Ca Trợ Duyên Đột Xuất (VD: Ca Sáng / Đột Xuất)</h2>
-                        <form method="POST" class="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                        <h2 class="text-lg font-bold text-slate-900 mb-3">➕ Thêm Ca Trợ Duyên Đột Xuất (VD: Ca Sáng)</h2>
+                        <form method="POST" class="grid grid-cols-1 sm:grid-cols-4 gap-2">
                             <input type="hidden" name="action" value="add_custom_shift">
                             <input type="hidden" name="event_id" value="<?php echo $activeEvent['id']; ?>">
                             <input type="text" name="shift_name" placeholder="Tên ca (VD: Ca Sáng)" required class="p-2 border rounded-lg text-sm">
                             <input type="text" name="shift_time" placeholder="Giờ ca (VD: 08h00')" required class="p-2 border rounded-lg text-sm">
-                            <button type="submit" class="py-2 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-lg text-sm">Thêm Ca Mới</button>
+                            <input type="number" min="1" name="max_target" value="10" placeholder="Chỉ tiêu" required class="p-2 border rounded-lg text-sm text-center">
+                            <button type="submit" class="py-2 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-lg text-sm">Thêm Ca</button>
                         </form>
                     </div>
                 <?php endif; ?>
 
-                <!-- TẠO MẪU TIN NHẮN ZALO (1-CLICK COPY) -->
+                <!-- MẪU TIN NHẮN ZALO AUTO (1-CLICK COPY) -->
                 <?php if ($activeEvent): ?>
                     <div class="bg-white rounded-2xl p-5 shadow-sm border border-slate-200">
                         <h2 class="text-xl font-bold text-slate-900 mb-2">📋 Mẫu Tin Nhắn Gửi Nhóm Zalo</h2>
@@ -519,10 +555,10 @@ Nam Mô A Di Đà Phật
 Kính thưa THẦY và liên hữu đồng tu: <?php echo htmlspecialchars($activeEvent['patient_name']); ?> yếu nên đạo tràng tổ chức trợ duyên cho bác ngày <?php echo count($shifts); ?> thời (<?php 
     $sInfo = [];
     foreach ($shifts as $s) {
-        $sInfo[] = $s['shift_name'] . " " . $s['shift_time'];
+        $sInfo[] = $s['shift_name'] . " " . $s['shift_time'] . " (~" . ($s['max_target']??10) . " vị)";
     }
     echo implode(", ", $sInfo);
-?>). Các bác đủ duyên thời nào mong các bác hoan hỷ. Vì nhà <?php echo htmlspecialchars($activeEvent['patient_name']); ?> chật nên mỗi ca khoảng tầm 10 người và còn gia đình cũng đông, kính mong quý liên hữu hoan hỷ cùng tham gia.
+?>). Các bác đủ duyên thời nào mong các bác hoan hỷ. Kính mong quý liên hữu hoan hỷ cùng tham gia.
 
 👉 Bấm vào link để xem & đăng ký ca:
 <?php echo $currentUrl; ?>
@@ -538,9 +574,9 @@ Nam Mô A Di Đà Phật
                     </div>
                 <?php endif; ?>
 
-                <!-- TẠO SỰ KIỆN MỚI HOÀN TOÀN -->
+                <!-- TẠO ĐỢT TRỢ DUYÊN MỚI HOÀN TOÀN -->
                 <div class="bg-white rounded-2xl p-5 shadow-sm border border-slate-200">
-                    <h2 class="text-xl font-bold text-slate-900 mb-4 pb-2 border-b">🆕 Khởi Tạo Đợt Trợ Duyên Mới Cho Người Khác</h2>
+                    <h2 class="text-xl font-bold text-slate-900 mb-4 pb-2 border-b">🆕 Khởi Tạo Đợt Trợ Duyên Mới</h2>
                     <form method="POST" class="space-y-3">
                         <input type="hidden" name="action" value="create_event">
                         
@@ -550,18 +586,22 @@ Nam Mô A Di Đà Phật
                         </div>
 
                         <div>
-                            <label class="block text-sm font-semibold text-slate-700 mb-1">Địa Chỉ / Ghi Chú:</label>
+                            <label class="block text-sm font-semibold text-slate-700 mb-1">Địa Chỉ / Ghi Chú Gia Đình:</label>
                             <input type="text" name="address" placeholder="Ví dụ: Thôn A, Xã B, Tỉnh C..." class="w-full p-2.5 border rounded-lg">
                         </div>
 
-                        <div class="grid grid-cols-2 gap-3">
+                        <div class="grid grid-cols-2 gap-3 border-t pt-2">
                             <div>
                                 <label class="block text-xs font-semibold text-slate-600 mb-1">Giờ Ca Chiều:</label>
-                                <input type="text" name="afternoon_time" value="14h15'" class="w-full p-2 border rounded-lg text-center">
+                                <input type="text" name="afternoon_time" value="14h15'" class="w-full p-2 border rounded-lg text-center mb-1">
+                                <label class="block text-[10px] text-amber-700 font-semibold">Chỉ tiêu ca Chiều (vị):</label>
+                                <input type="number" name="afternoon_target" value="10" class="w-full p-1.5 border rounded-lg text-center text-sm font-bold bg-amber-50">
                             </div>
                             <div>
                                 <label class="block text-xs font-semibold text-slate-600 mb-1">Giờ Ca Tối:</label>
-                                <input type="text" name="evening_time" value="19h15'" class="w-full p-2 border rounded-lg text-center">
+                                <input type="text" name="evening_time" value="19h15'" class="w-full p-2 border rounded-lg text-center mb-1">
+                                <label class="block text-[10px] text-indigo-700 font-semibold">Chỉ tiêu ca Tối (vị):</label>
+                                <input type="number" name="evening_target" value="10" class="w-full p-1.5 border rounded-lg text-center text-sm font-bold bg-indigo-50">
                             </div>
                         </div>
 
@@ -574,8 +614,8 @@ Nam Mô A Di Đà Phật
                 <!-- ĐÓNG ĐỢT TRỢ DUYÊN -->
                 <?php if ($activeEvent): ?>
                     <div class="bg-white rounded-2xl p-5 shadow-sm border border-slate-200">
-                        <h2 class="text-lg font-bold text-slate-900 mb-2">⚙️ Trạng Thái Trợ Duyên</h2>
-                        <p class="text-sm text-slate-600 mb-3">Đang trợ duyên: <strong><?php echo htmlspecialchars($activeEvent['patient_name']); ?></strong></p>
+                        <h2 class="text-lg font-bold text-slate-900 mb-2">⚙️ Đóng Đợt Trợ Duyên</h2>
+                        <p class="text-sm text-slate-600 mb-3">Đang chạy: <strong><?php echo htmlspecialchars($activeEvent['patient_name']); ?></strong></p>
                         <form method="POST" onsubmit="return confirm('Xác nhận hoàn thành đợt trợ duyên này?');">
                             <input type="hidden" name="action" value="complete_event">
                             <input type="hidden" name="event_id" value="<?php echo $activeEvent['id']; ?>">
@@ -614,7 +654,7 @@ Nam Mô A Di Đà Phật
                                     <th class="p-2.5">#</th>
                                     <th class="p-2.5">Họ và Tên Phật Tử</th>
                                     <th class="p-2.5">Vai trò</th>
-                                    <th class="p-2.5 text-right">Tổng Lượt Tham Gia</th>
+                                    <th class="p-2.5 text-right">Tổng Lượt</th>
                                 </tr>
                             </thead>
                             <tbody class="divide-y">
@@ -672,20 +712,19 @@ Nam Mô A Di Đà Phật
                 </div>
                 <p class="text-sm text-slate-600">Tài liệu này được nhúng sẵn để AI Agent (Aider / Antigravity IDE) đọc và hiểu toàn bộ kiến trúc dự án.</p>
                 <div class="p-4 bg-slate-900 text-slate-100 rounded-xl text-xs font-mono overflow-x-auto whitespace-pre-wrap leading-relaxed max-h-96">
-# PROJECT AGENT KIT - HỆ THỐNG TRỢ DUYÊN NIỆM PHẬT
-Triết lý: High-Touch, Low-Tech | Stack: PHP + SQLite
+# PROJECT AGENT KIT - HỆ THỐNG TRỢ DUYÊN NIỆM PHẬT (v2.1)
+Triết lý: High-Touch, Low-Tech | Stack: PHP + SQLite (WAL Mode)
 
-1. CẤU TRÚC BẢNG SQLITE (`database.sqlite`):
+1. ĐIỂM NÂNG CẤP V2.1:
+- Thêm trường `max_target` tùy chỉnh chỉ tiêu số người ưu tiên cho từng Ca và từng Đợt.
+- Admin có thể chỉnh sửa `max_target` độc lập cho Ca Chiều (VD: 8 vị), Ca Tối (VD: 15 vị).
+- Form đăng ký thể hiện số người ưu tiên riêng cho từng nút ca.
+
+2. CẤU TRÚC BẢNG SQLITE (`database.sqlite`):
 - `events`: id, patient_name, address, note, status ('active'/'completed')
-- `shifts`: id, event_id, shift_name, shift_time, max_target (mặc định 10)
+- `shifts`: id, event_id, shift_name, shift_time, max_target (mặc định 10), shift_date
 - `registrations`: id, shift_id, fullname, phone, role_type, registered_at
 - `logs`: id, action, details, created_at
-
-2. TÍNH NĂNG HOÀN THIỆN 100%:
-- Sửa đổi lịch trực linh hoạt không làm mất danh sách người đã đăng ký.
-- Thêm ca đột xuất (Ca Sáng, Ca Chiều, Ca Tối).
-- Thống kê dữ liệu lượt tham gia dài hạn cho Đạo tràng.
-- Ghi nhật ký hệ thống `logs` cho mọi thao tác.
                 </div>
             </div>
         <?php endif; ?>
