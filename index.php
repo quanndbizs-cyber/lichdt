@@ -1,114 +1,515 @@
 <?php
-// Tên file lưu dữ liệu đăng ký
-$dataFile = 'dangky_bacX.json';
+/**
+ * HỆ THỐNG SẮP LỊCH TRỢ DUYÊN NIỆM PHẬT - BAN HỘ NIỆM / TRỢ NIỆM
+ * Triết lý thiết kế: High-Touch, Low-Tech (Tối giản 1-chạm, chữ to, không cần đăng nhập)
+ * Lưu trữ: SQLite (database.sqlite)
+ */
 
-// Đọc dữ liệu hiện tại
-$registrations = file_exists($dataFile) ? json_decode(file_get_contents($dataFile), true) : [];
+// 1. CẤU HÌNH & KẾT NỐI CƠ SỞ DỮ LIỆU SQLITE
+$dbFile = __DIR__ . '/database.sqlite';
+try {
+    $pdo = new PDO("sqlite:" . $dbFile);
+    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+} catch (PDOException $e) {
+    die("Lỗi kết nối CSDL SQLite: " . $e->getMessage());
+}
 
-$message = "";
+// Tự động khởi tạo cấu trúc Bảng CSDL nếu chưa có
+$pdo->exec("
+    CREATE TABLE IF NOT EXISTS events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        patient_name TEXT NOT NULL,
+        address TEXT,
+        note TEXT,
+        status TEXT DEFAULT 'active',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
 
-// Xử lý khi Phật tử bấm nút Đăng ký
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['fullname'])) {
-    $name = trim($_POST['fullname']);
-    $shift = $_POST['shift'];
-    
-    if (!empty($name)) {
-        $registrations[] = [
-            'name' => htmlspecialchars($name),
-            'shift' => $shift,
-            'time' => date('H:i - d/m/Y')
-        ];
-        file_put_contents($dataFile, json_encode($registrations, JSON_UNESCAPED_UNICODE));
-        $message = "A Di Đà Phật! Đã ghi nhận Phật tử: <b>$name</b> đăng ký <b>$shift</b>.";
-    } else {
-        $message = "<span style='color:red;'>Vui lòng nhập tên/pháp danh trước khi chọn ca!</span>";
+    CREATE TABLE IF NOT EXISTS shifts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id INTEGER NOT NULL,
+        shift_name TEXT NOT NULL,
+        shift_time TEXT NOT NULL,
+        max_target INTEGER DEFAULT 10,
+        shift_date DATE,
+        FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS registrations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        shift_id INTEGER NOT NULL,
+        fullname TEXT NOT NULL,
+        phone TEXT,
+        role_type TEXT DEFAULT 'Thành viên',
+        registered_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (shift_id) REFERENCES shifts(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        action TEXT NOT NULL,
+        details TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+");
+
+// Chèn dữ liệu mẫu nếu DB hoàn toàn trống
+$stmtCheck = $pdo->query("SELECT COUNT(*) as cnt FROM events");
+if ($stmtCheck->fetch()['cnt'] == 0) {
+    $pdo->exec("INSERT INTO events (patient_name, address, note, status) VALUES 
+        ('Bác X', 'Nhà riêng Bác X (Gia đình chuẩn bị trang nghiêm)', 'Nhà chật, ưu tiên khoảng 10 vị/ca, hoan hỷ tùy duyên.', 'active')");
+    $eventId = $pdo->lastInsertId();
+    $today = date('Y-m-d');
+    $pdo->exec("INSERT INTO shifts (event_id, shift_name, shift_time, max_target, shift_date) VALUES 
+        ($eventId, 'Ca Chiều', '14h15\'', 10, '$today'),
+        ($eventId, 'Ca Tối', '19h15\'', 10, '$today')");
+}
+
+// 2. XỬ LÝ ACTION TỪ FORM (POST)
+$flashMessage = '';
+$flashType = 'success';
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $action = $_POST['action'] ?? '';
+
+    // Đăng ký ca trợ duyên
+    if ($action === 'register') {
+        $shiftId = intval($_POST['shift_id'] ?? 0);
+        $fullname = trim($_POST['fullname'] ?? '');
+        
+        if (!empty($fullname) && $shiftId > 0) {
+            $stmt = $pdo->prepare("INSERT INTO registrations (shift_id, fullname) VALUES (?, ?)");
+            $stmt->execute([$shiftId, $fullname]);
+            $flashMessage = "A Di Đà Phật! Đã ghi nhận Phật tử [ " . htmlspecialchars($fullname) . " ] đăng ký thành công.";
+        } else {
+            $flashMessage = "Vui lòng nhập Họ và Tên trước khi chọn ca.";
+            $flashType = 'error';
+        }
+    }
+
+    // Hủy đăng ký
+    if ($action === 'cancel_registration') {
+        $regId = intval($_POST['reg_id'] ?? 0);
+        if ($regId > 0) {
+            $stmt = $pdo->prepare("DELETE FROM registrations WHERE id = ?");
+            $stmt->execute([$regId]);
+            $flashMessage = "A Di Đà Phật! Đã hoan hỷ hủy lượt đăng ký.";
+        }
+    }
+
+    // Admin: Tạo sự kiện mới
+    if ($action === 'create_event') {
+        $patientName = trim($_POST['patient_name'] ?? '');
+        $address = trim($_POST['address'] ?? '');
+        $note = trim($_POST['note'] ?? '');
+        $afternoonTime = trim($_POST['afternoon_time'] ?? '14h15\'');
+        $eveningTime = trim($_POST['evening_time'] ?? '19h15\'');
+        
+        if (!empty($patientName)) {
+            // Đóng các sự kiện cũ
+            $pdo->exec("UPDATE events SET status = 'completed' WHERE status = 'active'");
+            
+            // Tạo sự kiện mới
+            $stmt = $pdo->prepare("INSERT INTO events (patient_name, address, note, status) VALUES (?, ?, ?, 'active')");
+            $stmt->execute([$patientName, $address, $note]);
+            $newEventId = $pdo->lastInsertId();
+            
+            // Tạo ca
+            $today = date('Y-m-d');
+            $stmtShift = $pdo->prepare("INSERT INTO shifts (event_id, shift_name, shift_time, max_target, shift_date) VALUES (?, ?, ?, 10, ?)");
+            $stmtShift->execute([$newEventId, 'Ca Chiều', $afternoonTime, $today]);
+            $stmtShift->execute([$newEventId, 'Ca Tối', $eveningTime, $today]);
+            
+            $flashMessage = "A Di Đà Phật! Đã khởi tạo đợt trợ duyên mới cho " . htmlspecialchars($patientName);
+        }
+    }
+
+    // Admin: Hoàn thành sự kiện
+    if ($action === 'complete_event') {
+        $eventId = intval($_POST['event_id'] ?? 0);
+        if ($eventId > 0) {
+            $stmt = $pdo->prepare("UPDATE events SET status = 'completed' WHERE id = ?");
+            $stmt->execute([$eventId]);
+            $flashMessage = "Đã đánh dấu hoàn thành ca trợ duyên.";
+        }
     }
 }
 
-// Đếm số người mỗi ca
-$countChieu = 0;
-$countToi = 0;
-foreach ($registrations as $r) {
-    if ($r['shift'] === 'Ca Chiều (14h15)') $countChieu++;
-    if ($r['shift'] === 'Ca Tối (19h15)') $countToi++;
+// 3. TRUY VẤN DỮ LIỆU HIỆN TẠI
+$mode = $_GET['mode'] ?? 'public'; // public, admin, test, agent_kit
+$currentEventId = intval($_GET['event_id'] ?? 0);
+
+if ($currentEventId > 0) {
+    $stmtEvent = $pdo->prepare("SELECT * FROM events WHERE id = ?");
+    $stmtEvent->execute([$currentEventId]);
+    $activeEvent = $stmtEvent->fetch();
+} else {
+    $stmtEvent = $pdo->query("SELECT * FROM events WHERE status = 'active' ORDER BY id DESC LIMIT 1");
+    $activeEvent = $stmtEvent->fetch();
+}
+
+// Nếu không có event active, lấy event gần nhất
+if (!$activeEvent) {
+    $stmtEvent = $pdo->query("SELECT * FROM events ORDER BY id DESC LIMIT 1");
+    $activeEvent = $stmtEvent->fetch();
+}
+
+$shifts = [];
+$registrationsByShift = [];
+
+if ($activeEvent) {
+    $stmtShifts = $pdo->prepare("SELECT * FROM shifts WHERE event_id = ? ORDER BY id ASC");
+    $stmtShifts->execute([$activeEvent['id']]);
+    $shifts = $stmtShifts->fetchAll();
+
+    foreach ($shifts as $s) {
+        $stmtReg = $pdo->prepare("SELECT * FROM registrations WHERE shift_id = ? ORDER BY registered_at ASC");
+        $stmtReg->execute([$s['id']]);
+        $registrationsByShift[$s['id']] = $stmtReg->fetchAll();
+    }
+}
+
+// 4. KIỂM THỬ TỰ ĐỘNG (?mode=test)
+$testResults = [];
+if ($mode === 'test') {
+    try {
+        // Test 1: SQLite Connection
+        $testResults[] = ["test" => "Kiểm tra kết nối SQLite PDO", "status" => true, "msg" => "Kết nối thành công"];
+        
+        // Test 2: Insert dummy registration
+        if (!empty($shifts)) {
+            $testShiftId = $shifts[0]['id'];
+            $pdo->prepare("INSERT INTO registrations (shift_id, fullname) VALUES (?, ?)")->execute([$testShiftId, "Test_Phật_Tử_Kiểm_Thử"]);
+            $dummyId = $pdo->lastInsertId();
+            $testResults[] = ["test" => "Thêm lượt đăng ký giả lập", "status" => true, "msg" => "Chèn ID: $dummyId thành công"];
+            
+            // Test 3: Delete dummy registration
+            $pdo->prepare("DELETE FROM registrations WHERE id = ?")->execute([$dummyId]);
+            $testResults[] = ["test" => "Xóa lượt đăng ký kiểm thử", "status" => true, "msg" => "Xóa dữ liệu test thành công"];
+        }
+        
+        // Test 4: Query tables
+        $tables = $pdo->query("SELECT name FROM sqlite_master WHERE type='table'")->fetchAll(PDO::FETCH_COLUMN);
+        $testResults[] = ["test" => "Cấu trúc Bảng SQLite", "status" => count($tables) >= 4, "msg" => "Tìm thấy các bảng: " . implode(", ", $tables)];
+    } catch (Exception $ex) {
+        $testResults[] = ["test" => "Lỗi Kiểm Thử", "status" => false, "msg" => $ex->getMessage()];
+    }
+}
+
+// Đơn vị đường dẫn hiện tại
+$protocol = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? "https" : "http";
+$currentUrl = $protocol . "://" . $_SERVER['HTTP_HOST'] . strtok($_SERVER["REQUEST_URI"], '?');
+if ($activeEvent) {
+    $currentUrl .= "?event_id=" . $activeEvent['id'];
 }
 ?>
-
 <!DOCTYPE html>
 <html lang="vi">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Đăng ký Trợ duyên Niệm Phật</title>
+    <title>Sắp Lịch Trợ Duyên Niệm Phật - Ban Trợ Niệm</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        body { font-family: Arial, sans-serif; background-color: #fcf8ec; margin: 0; padding: 15px; font-size: 20px; color: #333; }
-        .container { max-width: 600px; margin: 0 auto; background: #fff; padding: 20px; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); border: 2px solid #e0a96d; }
-        h2, h3 { text-align: center; color: #8b0000; margin-top: 5px; }
-        .announcement { background-color: #fff8e7; padding: 15px; border-left: 5px solid #d4af37; font-size: 18px; line-height: 1.6; margin-bottom: 20px; border-radius: 4px; white-space: pre-line; }
-        label { font-weight: bold; display: block; margin-bottom: 8px; color: #8b0000; }
-        input[type="text"] { width: 100%; padding: 15px; font-size: 22px; border: 2px solid #ccc; border-radius: 8px; box-sizing: border-box; margin-bottom: 20px; }
-        .btn { width: 100%; padding: 18px; font-size: 22px; font-weight: bold; color: #fff; border: none; border-radius: 10px; margin-bottom: 15px; cursor: pointer; text-align: center; }
-        .btn-chieu { background-color: #d97706; }
-        .btn-toi { background-color: #1e3a8a; }
-        .btn:hover { opacity: 0.9; }
-        .alert { background: #d1e7dd; color: #0f5132; padding: 15px; border-radius: 8px; text-align: center; margin-bottom: 20px; font-size: 20px; font-weight: bold; }
-        .list-box { margin-top: 30px; border-top: 2px dashed #ccc; padding-top: 15px; }
-        .badge { background: #8b0000; color: #fff; padding: 3px 10px; border-radius: 12px; font-size: 18px; }
-        ul { padding-left: 20px; }
-        li { margin-bottom: 10px; font-size: 20px; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+        .text-elder { font-size: 1.25rem; line-height: 1.75rem; }
+        .btn-touch { min-height: 54px; font-size: 1.25rem; }
     </style>
 </head>
-<body>
+<body class="bg-amber-50 text-slate-800 min-h-screen pb-12">
 
-<div class="container">
-    <h2>Trợ Duyên Niệm Phật</h2>
-    
-    <div class="announcement">Nam Mô A Di Đà Phật
+    <!-- Header Trang -->
+    <header class="bg-amber-700 text-amber-50 shadow-md py-4 px-4 sticky top-0 z-50">
+        <div class="max-w-xl mx-auto flex justify-between items-center">
+            <div>
+                <h1 class="text-xl sm:text-2xl font-bold tracking-wide">NAM MÔ A DI ĐÀ PHẬT</h1>
+                <p class="text-xs text-amber-200">Đạo Tràng Trợ Duyên Niệm Phật</p>
+            </div>
+            <div class="space-x-1 text-sm font-medium">
+                <a href="?mode=public<?php echo $activeEvent ? '&event_id='.$activeEvent['id'] : ''; ?>" class="px-3 py-1.5 rounded <?php echo $mode==='public'?'bg-amber-900 text-white':'bg-amber-800/60 hover:bg-amber-800'; ?>">Trợ Duyên</a>
+                <a href="?mode=admin" class="px-3 py-1.5 rounded <?php echo $mode==='admin'?'bg-amber-900 text-white':'bg-amber-800/60 hover:bg-amber-800'; ?>">Quản Trị</a>
+            </div>
+        </div>
+    </header>
 
-kính thưa THẦY và liên hữu đồng tu bác X yếu nên đạo tràng tổ chức trợ duyên cho bác ngày 2 thời chiều 2h15' tối 7h15'các bác đủ duyên thời nào mong các bác hoan hỷ vì nhà bác X chật nên mỗi ca khoảng tầm 10 người và còn gia đình cũng đông ,các bác hoan hỷ cùng tham gia ,con xin thành kính tri ân cđ của quí Thầy cùng liên hữu đồng tu ạ
+    <main class="max-w-xl mx-auto px-4 mt-4">
 
-Nam Mô A Di Đà Phật</div>
+        <!-- Thông báo Flash Message -->
+        <?php if (!empty($flashMessage)): ?>
+            <div class="p-4 mb-4 rounded-xl font-medium text-center text-lg shadow-sm <?php echo $flashType==='success'?'bg-emerald-100 border border-emerald-300 text-emerald-800':'bg-rose-100 border border-rose-300 text-rose-800'; ?>">
+                <?php echo $flashMessage; ?>
+            </div>
+        <?php endif; ?>
 
-    <?php if (!empty($message)): ?>
-        <div class="alert"><?= $message ?></div>
-    <?php endif; ?>
+        <?php if ($mode === 'public'): ?>
+            <!-- GIAO DIỆN PHẬT TỬ (HIGH-TOUCH, LOW-TECH) -->
+            <?php if ($activeEvent): ?>
+                <div class="bg-white rounded-2xl p-5 shadow-sm border border-amber-200/80 mb-5">
+                    <div class="inline-block px-3 py-1 bg-amber-100 text-amber-800 text-xs font-semibold rounded-full mb-2">
+                        Thời gian này đang trợ duyên
+                    </div>
+                    <h2 class="text-2xl font-bold text-amber-900 mb-1">Trợ duyên: <?php echo htmlspecialchars($activeEvent['patient_name']); ?></h2>
+                    <p class="text-slate-600 text-elder font-medium mb-2">📍 Địa chỉ: <?php echo htmlspecialchars($activeEvent['address']); ?></p>
+                    
+                    <div class="p-3 bg-amber-50/80 rounded-xl border border-amber-200 text-slate-700 text-base leading-relaxed my-3">
+                        <strong class="text-amber-900">Lời dặn Ban Điều Hành:</strong><br>
+                        "Nam Mô A Di Đà Phật. Kính thưa THẦY và liên hữu đồng tu: <?php echo htmlspecialchars($activeEvent['patient_name']); ?> yếu nên đạo tràng tổ chức trợ duyên ngày 2 thời. Kính mong quý liên hữu hoan hỷ đăng ký tham gia tùy duyên."
+                    </div>
+                </div>
 
-    <form method="POST" action="">
-        <label for="fullname">1. Nhập Họ Tên / Pháp Danh:</label>
-        <input type="text" id="fullname" name="fullname" placeholder="Ví dụ: Đắc Lực..." required>
+                <!-- FORM ĐĂNG KÝ NHANH 1-CHẠM -->
+                <div class="bg-white rounded-2xl p-5 shadow-md border border-amber-300 mb-6">
+                    <h3 class="text-xl font-bold text-slate-900 mb-3 flex items-center gap-2">
+                        <span>✍️</span> Đăng Ký Trực Tiếp (Không cần mật khẩu)
+                    </h3>
+                    
+                    <form method="POST" id="regForm" class="space-y-4">
+                        <input type="hidden" name="action" value="register">
+                        <input type="hidden" name="shift_id" id="selectedShiftId" value="">
 
-        <label>2. Bấm chọn ca muốn đi:</label>
-        <button type="submit" name="shift" value="Ca Chiều (14h15)" class="btn btn-chieu">
-            Đăng Ký CA CHIỀU (14h15) <br><small>(Đã có <?= $countChieu ?> người)</small>
-        </button>
-        
-        <button type="submit" name="shift" value="Ca Tối (19h15)" class="btn btn-toi">
-            Đăng Ký CA TỐI (19h15) <br><small>(Đã có <?= $countToi ?> người)</small>
-        </button>
-    </form>
+                        <div>
+                            <label class="block text-slate-700 font-bold text-elder mb-1">Họ và Tên Phật Tử:</label>
+                            <input type="text" name="fullname" required placeholder="Nhập tên của Bác/Cô/Chú..." class="w-full text-elder p-3.5 border-2 border-amber-300 rounded-xl focus:outline-none focus:border-amber-600 bg-amber-50/30">
+                        </div>
 
-    <div class="list-box">
-        <h3>Danh Sách Đã Đăng Ký</h3>
-        
-        <p><b>☀️ Ca Chiều 2h15' <span class="badge"><?= $countChieu ?> người</span></b></p>
-        <ol>
-            <?php foreach ($registrations as $r): ?>
-                <?php if ($r['shift'] === 'Ca Chiều (14h15)'): ?>
-                    <li><b><?= $r['name'] ?></b></li>
+                        <p class="text-sm text-slate-500 font-medium">Bấm đúng vào ca mong muốn để hoàn tất đăng ký:</p>
+
+                        <div class="grid grid-cols-1 gap-3">
+                            <?php foreach ($shifts as $s): ?>
+                                <?php 
+                                    $count = count($registrationsByShift[$s['id']] ?? []);
+                                    $isAfternoon = strpos(mb_strtolower($s['shift_name']), 'chiều') !== false;
+                                    $btnColor = $isAfternoon ? 'bg-amber-500 hover:bg-amber-600 text-white' : 'bg-indigo-700 hover:bg-indigo-800 text-white';
+                                ?>
+                                <button type="button" onclick="submitRegister(<?php echo $s['id']; ?>)" class="btn-touch w-full <?php echo $btnColor; ?> font-bold rounded-xl shadow-md flex justify-between items-center px-5 transition-transform active:scale-95">
+                                    <span><?php echo htmlspecialchars($s['shift_name']); ?> (<?php echo htmlspecialchars($s['shift_time']); ?>)</span>
+                                    <span class="text-sm bg-white/20 px-3 py-1 rounded-full font-normal">Đã có <?php echo $count; ?> vị</span>
+                                </button>
+                            <?php endforeach; ?>
+                        </div>
+                    </form>
+                </div>
+
+                <!-- DANH SÁCH THÀNH VIÊN CÁC CA -->
+                <div class="space-y-5">
+                    <?php foreach ($shifts as $s): ?>
+                        <?php 
+                            $regs = $registrationsByShift[$s['id']] ?? [];
+                            $count = count($regs);
+                            $max = $s['max_target'];
+                            $isAfternoon = strpos(mb_strtolower($s['shift_name']), 'chiều') !== false;
+                            $headerBg = $isAfternoon ? 'bg-amber-100 text-amber-900 border-amber-300' : 'bg-indigo-100 text-indigo-900 border-indigo-300';
+                        ?>
+                        <div class="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
+                            <div class="p-4 border-b font-bold text-lg flex justify-between items-center <?php echo $headerBg; ?>">
+                                <div>
+                                    <span><?php echo htmlspecialchars($s['shift_name']); ?> (<?php echo htmlspecialchars($s['shift_time']); ?>)</span>
+                                </div>
+                                <span class="text-sm px-3 py-1 rounded-full font-semibold <?php echo $count >= $max ? 'bg-amber-200 text-amber-900':'bg-white/80 text-slate-700'; ?>">
+                                    <?php echo $count; ?>/<?php echo $max; ?> vị
+                                </span>
+                            </div>
+
+                            <div class="p-4">
+                                <?php if ($count >= $max): ?>
+                                    <p class="text-sm text-amber-800 bg-amber-50 p-2.5 rounded-lg border border-amber-200 mb-3">
+                                        🌸 Ca đã đủ chỉ tiêu <?php echo $max; ?> vị. Quý liên hữu tùy duyên đăng ký thêm nếu thuận tiện!
+                                    </p>
+                                <?php endif; ?>
+
+                                <?php if (empty($regs)): ?>
+                                    <p class="text-slate-400 italic text-center py-3">Chưa có liên hữu nào đăng ký ca này.</p>
+                                <?php else: ?>
+                                    <ul class="divide-y divide-slate-100">
+                                        <?php foreach ($regs as $idx => $r): ?>
+                                            <li class="py-2.5 flex justify-between items-center">
+                                                <span class="text-elder font-medium text-slate-800">
+                                                    <span class="text-amber-700 font-bold w-6 inline-block"><?php echo $idx + 1; ?>.</span>
+                                                    <?php echo htmlspecialchars($r['fullname']); ?>
+                                                </span>
+                                                <form method="POST" inline onsubmit="return confirm('Xác nhận xóa đăng ký này?');">
+                                                    <input type="hidden" name="action" value="cancel_registration">
+                                                    <input type="hidden" name="reg_id" value="<?php echo $r['id']; ?>">
+                                                    <button type="submit" class="text-xs text-rose-500 hover:text-rose-700 px-2 py-1 bg-rose-50 rounded hover:bg-rose-100">Xóa</button>
+                                                </form>
+                                            </li>
+                                        <?php endforeach; ?>
+                                    </ul>
+                                <?php endif; ?>
+                            </div>
+                        </div>
+                    <?php endforeach; ?>
+                </div>
+
+            <?php else: ?>
+                <div class="bg-white rounded-2xl p-8 text-center shadow-sm">
+                    <p class="text-elder text-slate-600 mb-4">Hiện tại chưa có lịch trợ duyên nào đang kích hoạt.</p>
+                    <a href="?mode=admin" class="inline-block px-5 py-2.5 bg-amber-700 text-white rounded-xl font-bold">Vào trang Quản trị để tạo mới</a>
+                </div>
+            <?php endif; ?>
+
+        <?php elseif ($mode === 'admin'): ?>
+            <!-- GIAO DIỆN QUẢN TRỊ (ADMIN DASHBOARD) -->
+            <div class="space-y-6">
+                
+                <!-- TẠO SỰ KIỆN MỚI -->
+                <div class="bg-white rounded-2xl p-5 shadow-sm border border-slate-200">
+                    <h2 class="text-xl font-bold text-slate-900 mb-4 pb-2 border-b">➕ Khởi Tạo Đợt Trợ Duyên Mới</h2>
+                    <form method="POST" class="space-y-3">
+                        <input type="hidden" name="action" value="create_event">
+                        
+                        <div>
+                            <label class="block text-sm font-semibold text-slate-700 mb-1">Tên Người Được Trợ Duyên (Bác/Cụ):</label>
+                            <input type="text" name="patient_name" required placeholder="Ví dụ: Bác X, Cụ Y..." class="w-full p-2.5 border rounded-lg">
+                        </div>
+
+                        <div>
+                            <label class="block text-sm font-semibold text-slate-700 mb-1">Địa Chỉ / Ghi Chú:</label>
+                            <input type="text" name="address" placeholder="Ví dụ: Thôn A, Xã B, Tỉnh C..." class="w-full p-2.5 border rounded-lg">
+                        </div>
+
+                        <div class="grid grid-cols-2 gap-3">
+                            <div>
+                                <label class="block text-xs font-semibold text-slate-600 mb-1">Giờ Ca Chiều:</label>
+                                <input type="text" name="afternoon_time" value="14h15'" class="w-full p-2 border rounded-lg text-center">
+                            </div>
+                            <div>
+                                <label class="block text-xs font-semibold text-slate-600 mb-1">Giờ Ca Tối:</label>
+                                <input type="text" name="evening_time" value="19h15'" class="w-full p-2 border rounded-lg text-center">
+                            </div>
+                        </div>
+
+                        <button type="submit" class="w-full py-3 bg-amber-700 hover:bg-amber-800 text-white font-bold rounded-xl mt-2">
+                            Kích Hoạt Lịch Trợ Duyên Mới
+                        </button>
+                    </form>
+                </div>
+
+                <!-- TẠO MẪU TIN NHẮN ZALO (1-CLICK COPY) -->
+                <?php if ($activeEvent): ?>
+                    <div class="bg-white rounded-2xl p-5 shadow-sm border border-slate-200">
+                        <h2 class="text-xl font-bold text-slate-900 mb-2">📋 Mẫu Tin Nhắn Gửi Nhóm Zalo</h2>
+                        <p class="text-xs text-slate-500 mb-3">Copy đoạn văn bản dưới đây để dán vào nhóm Zalo Đạo tràng:</p>
+
+                        <div id="zaloTemplate" class="p-4 bg-slate-50 rounded-xl border text-slate-800 text-sm leading-relaxed whitespace-pre-line font-mono mb-3">
+Nam Mô A Di Đà Phật
+
+Kính thưa THẦY và liên hữu đồng tu: <?php echo htmlspecialchars($activeEvent['patient_name']); ?> yếu nên đạo tràng tổ chức trợ duyên cho bác ngày 2 thời (Chiều <?php echo htmlspecialchars($shifts[0]['shift_time'] ?? "14h15'"); ?>, Tối <?php echo htmlspecialchars($shifts[1]['shift_time'] ?? "19h15'"); ?>). Các bác đủ duyên thời nào mong các bác hoan hỷ. Vì nhà <?php echo htmlspecialchars($activeEvent['patient_name']); ?> chật nên mỗi ca khoảng tầm 10 người và còn gia đình cũng đông, kính mong quý liên hữu hoan hỷ cùng tham gia.
+
+👉 Bấm vào link để xem & đăng ký ca:
+<?php echo $currentUrl; ?>
+
+
+Con xin thành kính tri ân công đức của quý Thầy cùng liên hữu đồng tu ạ.
+Nam Mô A Di Đà Phật
+                        </div>
+
+                        <button onclick="copyZaloText()" class="w-full py-3 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-xl flex justify-center items-center gap-2">
+                            <span>📲</span> Sao Chép Tin Nhắn Zalo (1-Click)
+                        </button>
+                    </div>
+
+                    <!-- THAO TÁC SỰ KIỆN HIỆN TẠI -->
+                    <div class="bg-white rounded-2xl p-5 shadow-sm border border-slate-200">
+                        <h2 class="text-lg font-bold text-slate-900 mb-2">⚙️ Trạng Thái Trợ Duyên Hiện Tại</h2>
+                        <p class="text-sm text-slate-600 mb-3">Đang chạy: <strong><?php echo htmlspecialchars($activeEvent['patient_name']); ?></strong></p>
+                        <form method="POST" onsubmit="return confirm('Xác nhận hoàn thành đợt trợ duyên này?');">
+                            <input type="hidden" name="action" value="complete_event">
+                            <input type="hidden" name="event_id" value="<?php echo $activeEvent['id']; ?>">
+                            <button type="submit" class="px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-800 font-semibold rounded-lg text-sm">
+                                Đóng Đợt Trợ Duyên Này
+                            </button>
+                        </form>
+                    </div>
                 <?php endif; ?>
-            <?php endforeach; ?>
-        </ol>
 
-        <p><b>🌙 Ca Tối 7h15' <span class="badge"><?= $countToi ?> người</span></b></p>
-        <ol>
-            <?php foreach ($registrations as $r): ?>
-                <?php if ($r['shift'] === 'Ca Tối (19h15)'): ?>
-                    <li><b><?= $r['name'] ?></b></li>
+                <!-- TÍNH NĂNG MỞ RỘNG: LẬP TÀI LIỆU & KIỂM THỬ -->
+                <div class="flex gap-2">
+                    <a href="?mode=test" class="flex-1 py-2.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-center font-semibold rounded-xl border border-indigo-200 text-sm">🧪 Chạy Automated Test</a>
+                    <a href="?mode=agent_kit" class="flex-1 py-2.5 bg-amber-50 hover:bg-amber-100 text-amber-800 text-center font-semibold rounded-xl border border-amber-200 text-sm">📄 Xem Project Agent Kit</a>
+                </div>
+
+            </div>
+
+        <?php elseif ($mode === 'test'): ?>
+            <!-- GIAO DIỆN KIỂM THỬ TỰ ĐỘNG (UNIT TEST RUNNER) -->
+            <div class="bg-white rounded-2xl p-5 shadow-sm border border-slate-200 space-y-4">
+                <div class="flex justify-between items-center border-b pb-3">
+                    <h2 class="text-xl font-bold text-slate-900">🧪 Kết Quả Tự Động Kiểm Thử (Unit Test)</h2>
+                    <a href="?mode=admin" class="text-sm text-amber-700 font-semibold">&larr; Quay lại Admin</a>
+                </div>
+
+                <div class="space-y-2">
+                    <?php 
+                    $allPass = true;
+                    foreach ($testResults as $t): 
+                        if (!$t['status']) $allPass = false;
+                    ?>
+                        <div class="p-3 rounded-lg border flex justify-between items-center <?php echo $t['status']?'bg-emerald-50 border-emerald-200 text-emerald-800':'bg-rose-50 border-rose-200 text-rose-800'; ?>">
+                            <div>
+                                <strong class="block text-sm"><?php echo htmlspecialchars($t['test']); ?></strong>
+                                <span class="text-xs opacity-80"><?php echo htmlspecialchars($t['msg']); ?></span>
+                            </div>
+                            <span class="font-bold text-sm"><?php echo $t['status'] ? 'PASS ✅' : 'FAIL ❌'; ?></span>
+                        </div>
+                    <?php endforeach; ?>
+                </div>
+
+                <?php if ($allPass): ?>
+                    <div class="p-4 bg-emerald-600 text-white font-bold rounded-xl text-center text-lg mt-4 shadow">
+                        ✅ TẤT CẢ UNIT TEST TRUY VẤN SQLITE HOẠT ĐỘNG HOÀN HẢO!
+                    </div>
                 <?php endif; ?>
-            <?php endforeach; ?>
-        </ol>
-    </div>
-</div>
+            </div>
 
+        <?php elseif ($mode === 'agent_kit'): ?>
+            <!-- GIAO DIỆN TÀI LIỆU AGENT KIT FOR ANTIGRAVITY IDE -->
+            <div class="bg-white rounded-2xl p-5 shadow-sm border border-slate-200 space-y-3">
+                <div class="flex justify-between items-center border-b pb-3">
+                    <h2 class="text-xl font-bold text-slate-900">📄 Project Agent Kit (Antigravity IDE)</h2>
+                    <a href="?mode=admin" class="text-sm text-amber-700 font-semibold">&larr; Quay lại Admin</a>
+                </div>
+                <p class="text-sm text-slate-600">Tài liệu này được nhúng sẵn để AI Agent (Aider / Antigravity IDE) đọc và hiểu toàn bộ kiến trúc dự án.</p>
+                <div class="p-4 bg-slate-900 text-slate-100 rounded-xl text-xs font-mono overflow-x-auto whitespace-pre-wrap leading-relaxed max-h-96">
+# PROJECT AGENT KIT - HỆ THỐNG TRỢ DUYÊN NIỆM PHẬT
+Triết lý: High-Touch, Low-Tech | Stack: PHP + SQLite
+
+1. CẤU TRÚC BẢNG SQLITE (`database.sqlite`):
+- `events`: id, patient_name, address, note, status ('active'/'completed')
+- `shifts`: id, event_id, shift_name, shift_time, max_target (mặc định 10)
+- `registrations`: id, shift_id, fullname, phone, role_type, registered_at
+- `logs`: id, action, details, created_at
+
+2. QUY TẮC PHÁT TRIỂN:
+- Giữ giao diện người dùng đơn giản 1-chạm (Font chữ 20px+).
+- Không bắt buộc đăng nhập đối với Phật tử cao tuổi.
+- Mọi thao tác cập nhật theo 1 URL duy nhất (`index.php?event_id=X`).
+- Tránh chặn cứng đăng ký khi quá 10 người (áp dụng tâm lý tùy duyên).
+                </div>
+            </div>
+        <?php endif; ?>
+
+    </main>
+
+    <!-- Script tương tác JS đơn giản -->
+    <script>
+        function submitRegister(shiftId) {
+            document.getElementById('selectedShiftId').value = shiftId;
+            document.getElementById('regForm').submit();
+        }
+
+        function copyZaloText() {
+            const text = document.getElementById('zaloTemplate').innerText;
+            const textarea = document.createElement('textarea');
+            textarea.value = text;
+            document.body.appendChild(textarea);
+            textarea.select();
+            document.execCommand('copy');
+            document.body.removeChild(textarea);
+            alert('A Di Đà Phật! Đã sao chép tin nhắn Zalo vào bộ nhớ tạm.');
+        }
+    </script>
 </body>
 </html>
