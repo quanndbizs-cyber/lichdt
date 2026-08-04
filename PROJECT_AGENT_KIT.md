@@ -1,8 +1,8 @@
-# **📖 PROJECT AGENT KIT: HỆ THỐNG WEB SẮP LỊCH TRỢ DUYÊN NIỆM PHẬT (v2.1)**
+# **📖 PROJECT AGENT KIT: HỆ THỐNG WEB SẮP LỊCH TRỢ DUYÊN NIỆM PHẬT (v2.2)**
 
 **Môi trường:** Debian Server / PHP 8.x \+ SQLite PDO (WAL Mode) / Antigravity IDE & Aider CLI
 
-**Triết lý cốt lõi:** High-Touch, Low-Tech (Càng đơn giản càng tốt, chữ to, 1-click, không mật khẩu).
+**Triết lý cốt lõi:** High-Touch, Low-Tech (Càng đơn giản càng tốt, chữ to, tự nhận diện danh tính Zalo, không mật khẩu).
 
 ## **🏛️ 1\. Cấu Trúc Tổng Quan Dự Án**
 
@@ -41,6 +41,7 @@ Dự án sử dụng kiến trúc **Single-File Architecture** kết hợp Cơ s
 * fullname: TEXT (Họ tên Phật tử)  
 * phone: TEXT  
 * role\_type: TEXT DEFAULT 'Thành viên' ('Thành viên' | 'Ban điều hành')  
+* zalo\_id: TEXT (Mã nhận diện tự động Zalo)  
 * registered\_at: DATETIME
 
 ### **Bảng logs (Nhật Ký Hệ Thống / Audit Trail)**
@@ -56,9 +57,9 @@ Dự án sử dụng kiến trúc **Single-File Architecture** kết hợp Cơ s
 | :---- | :---- | :---- | :---- |
 | Khởi tạo CSDL SQLite tự động via PDO (4 bảng) | System | **COMPLETED** | Bật chế độ PRAGMA journal\_mode \= WAL |
 | Giao diện Phật tử cao tuổi (Font 20px+, 1-click) | UI/UX | **COMPLETED** | Nút Cam (Chiều), Nút Xanh (Tối) |
-| Đăng ký không mật khẩu & Nhận phản hồi instant | Core | **COMPLETED** | Lưu vĩnh viễn vào SQLite |
+| **Tự động nhận diện Phật tử qua Zalo (Zalo Auto-ID)** | Feature | **COMPLETED** | Không cần gõ lại tên từ lần thứ 2, nhớ danh tính Zalo WebView |
 | Cảnh báo giới hạn mềm (Tùy duyên đăng ký thêm) | Logic | **COMPLETED** | Không chặn cứng lượt đăng ký |
-| **Điều chỉnh chỉ tiêu số người ưu tiên từng Ca & Đợt** | Feature | **COMPLETED** | Tùy biến max\_target từng Ca độc lập |
+| Điều chỉnh chỉ tiêu số người ưu tiên từng Ca & Đợt | Feature | **COMPLETED** | Tùy biến max\_target từng Ca độc lập |
 | Cập nhật giờ ca/ghi chú linh hoạt cho đợt đang chạy | Feature | **COMPLETED** | Không mất danh sách đã đăng ký |
 | Thêm ca đột xuất linh hoạt (Ca Sáng, Ca Đột Xuất) | Feature | **COMPLETED** | Nhập tên ca, giờ ca và chỉ tiêu riêng |
 | Công cụ 1-Click Copy Mẫu Tin Nhắn Zalo | Feature | **COMPLETED** | Tự tạo mẫu tin nhắn hiển thị chỉ tiêu từng ca |
@@ -68,8 +69,8 @@ Dự án sử dụng kiến trúc **Single-File Architecture** kết hợp Cơ s
 
 ## **🛠️ 4\. Chỉ Thị Dành Cho AI Agent / Antigravity IDE Khi Tiếp Nhuận**
 
-1. **Thực thi nguyên tắc High-Touch, Low-Tech**: Giữ nguyên tính năng đăng ký 1-click không cần đăng nhập cho Phật tử cao tuổi.  
-2. **Quản lý chỉ tiêu mềm**: max\_target chỉ mang tính chất hướng dẫn ưu tiên số lượng phù hợp với không gian nhà bệnh nhân, tuyệt đối không dùng cờ khóa đăng ký khi vọt qua chỉ tiêu.  
+1. **Thực thi nguyên tắc High-Touch, Low-Tech**: Duy trì tính năng nhớ tên vĩnh viễn trên Zalo WebView local storage. Phật tử chỉ nhập tên lần đầu duy nhất.  
+2. **Quản lý chỉ tiêu mềm**: max\_target chỉ mang tính chất hướng dẫn ưu tiên số lượng phù hợp với không gian nhà bệnh nhân.  
 3. **Giữ an toàn SQLite**: Mọi thao tác truy vấn đều phải qua PDO Prepared Statements.  
 4. **Kiểm thử thường xuyên**: Kiểm tra hệ thống bằng php index.php hoặc URL ?mode=test.
 
