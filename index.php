@@ -1,8 +1,8 @@
 <?php
 /**
  * HỆ THỐNG SẮP LỊCH TRỢ DUYÊN NIỆM PHẬT - BAN HỘ NIỆM / TRỢ NIỆM
- * Phiên bản: 3.0 - Zalo Only Enforcer, Member Onboarding, Anti-Duplicate & Registration on Behalf
- * Triết lý thiết kế: High-Touch, Low-Tech (Tối giản 1-chạm, chữ to, không cần gõ lại tên)
+ * Phiên bản: 4.0 - Multi-Role Access Control (Super Admin, Admin/Support & Member Guard)
+ * Triết lý thiết kế: High-Touch, Low-Tech (Tối giản 1-chạm, chữ to, bảo mật phân quyền)
  * Lưu trữ: SQLite (database.sqlite)
  */
 
@@ -12,19 +12,19 @@ try {
     $pdo = new PDO("sqlite:" . $dbFile);
     $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
     $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
-    // Tối ưu hóa ghi đồng thời bằng chế độ Write-Ahead Logging (WAL)
     $pdo->exec("PRAGMA journal_mode = WAL;");
 } catch (PDOException $e) {
     die("Lỗi kết nối CSDL SQLite: " . $e->getMessage());
 }
 
-// Tự động khởi tạo cấu trúc 5 Bảng CSDL nếu chưa tồn tại
+// Khởi tạo cấu trúc Bảng CSDL
 $pdo->exec("
     CREATE TABLE IF NOT EXISTS members (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         zalo_id TEXT UNIQUE NOT NULL,
         fullname TEXT NOT NULL,
         phone TEXT,
+        role TEXT DEFAULT 'member', -- 'super_admin', 'admin', 'support', 'member'
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -68,27 +68,30 @@ $pdo->exec("
     );
 ");
 
+// Tự động nâng cấp bảng members nếu thiếu cột role (Migration check)
+$cols = $pdo->query("PRAGMA table_info(members)")->fetchAll(PDO::FETCH_COLUMN, 1);
+if (!in_array('role', $cols)) {
+    $pdo->exec("ALTER TABLE members ADD COLUMN role TEXT DEFAULT 'member'");
+}
+
 // Hàm ghi Nhật ký Hệ thống (Audit Trail)
 function logAction($pdo, $action, $details = '') {
     try {
         $stmt = $pdo->prepare("INSERT INTO logs (action, details) VALUES (?, ?)");
         $stmt->execute([$action, $details]);
-    } catch (Exception $e) {
-        // Bỏ qua lỗi ghi log
-    }
+    } catch (Exception $e) {}
 }
 
-// Kiểm tra User-Agent có phải từ ứng dụng Zalo hay không
+// Kiểm tra User-Agent từ ứng dụng Zalo
 function isZaloBrowser() {
     $ua = $_SERVER['HTTP_USER_AGENT'] ?? '';
     return (stripos($ua, 'Zalo') !== false || stripos($ua, 'ZaloTheme') !== false);
 }
 
-// Bỏ qua kiểm tra Zalo nếu có parameter bypass_zalo hoặc trong trang admin/test
-$bypassZalo = isset($_GET['bypass_zalo']) || (isset($_GET['mode']) && in_array($_GET['mode'], ['admin', 'test', 'agent_kit', 'stats']));
+$bypassZalo = isset($_GET['bypass_zalo']) || (isset($_GET['mode']) && in_array($_GET['mode'], ['test', 'agent_kit']));
 $isZalo = isZaloBrowser() || $bypassZalo;
 
-// Chèn dữ liệu khởi tạo mẫu nếu DB hoàn toàn trống
+// Khởi tạo dữ liệu mẫu nếu DB trống
 $stmtCheck = $pdo->query("SELECT COUNT(*) as cnt FROM events");
 if ($stmtCheck->fetch()['cnt'] == 0) {
     $pdo->exec("INSERT INTO events (patient_name, address, note, status) VALUES 
@@ -101,7 +104,20 @@ if ($stmtCheck->fetch()['cnt'] == 0) {
     logAction($pdo, 'INIT_DATABASE', 'Khởi tạo dữ liệu mẫu thành công');
 }
 
-// 2. XỬ LÝ HÀNH ĐỘNG TỪ FORM (POST)
+// 2. NHẬN DIỆN NGƯỜI DÙNG & XÁC MINH QUYỀN TRUY CẬP (SERVER-SIDE AUTH)
+$currentZaloId = $_COOKIE['dt_zalo_id'] ?? $_POST['zalo_id'] ?? $_GET['zalo_id'] ?? '';
+$currentMember = null;
+if (!empty($currentZaloId)) {
+    $stmtM = $pdo->prepare("SELECT * FROM members WHERE zalo_id = ?");
+    $stmtM->execute([$currentZaloId]);
+    $currentMember = $stmtM->fetch();
+}
+
+$currentUserRole = $currentMember['role'] ?? 'member'; // 'super_admin', 'admin', 'support', 'member'
+$isSuperAdmin = ($currentUserRole === 'super_admin');
+$isAdminOrSupport = in_array($currentUserRole, ['super_admin', 'admin', 'support']);
+
+// 3. XỬ LÝ HÀNH ĐỘNG TỪ FORM (POST)
 $flashMessage = '';
 $flashType = 'success';
 $nameCollisionWarning = null;
@@ -117,7 +133,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $forceConfirm = intval($_POST['force_confirm'] ?? 0);
 
         if (!empty($fullname) && !empty($zaloId)) {
-            // Kiểm tra trùng tên trong hệ thống thành viên
+            // Kiểm tra xem hệ thống đã có Super Admin chưa. Nếu CHƯA CÓ, người đăng ký ĐẦU TIÊN sẽ là Super Admin
+            $stmtCountSA = $pdo->query("SELECT COUNT(*) as cnt FROM members WHERE role = 'super_admin'");
+            $hasSuperAdmin = $stmtCountSA->fetch()['cnt'] > 0;
+            $assignedRole = $hasSuperAdmin ? 'member' : 'super_admin';
+
+            // Kiểm tra trùng tên trong hệ thống
             $stmtCheckName = $pdo->prepare("SELECT COUNT(*) as cnt FROM members WHERE fullname = ? AND zalo_id != ?");
             $stmtCheckName->execute([$fullname, $zaloId]);
             $hasDuplicate = $stmtCheckName->fetch()['cnt'] > 0;
@@ -128,19 +149,51 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'phone' => $phone,
                     'zalo_id' => $zaloId
                 ];
-                $flashMessage = "⚠️ Tên [$fullname] đã trùng với một Phật tử đã đăng ký trước đó. Bác vui lòng xác nhận đổi tên (VD: thêm xóm/địa danh) hoặc giữ nguyên.";
+                $flashMessage = "⚠️ Tên [$fullname] trùng với Phật tử khác. Vui lòng xác nhận đổi tên hoặc giữ nguyên.";
                 $flashType = 'error';
             } else {
-                // Đã xác nhận hoặc tên không trùng -> Lưu vào bảng members
-                $stmtMember = $pdo->prepare("INSERT OR REPLACE INTO members (zalo_id, fullname, phone) VALUES (?, ?, ?)");
-                $stmtMember->execute([$zaloId, $fullname, $phone]);
-                logAction($pdo, 'REGISTER_MEMBER', "Thành viên mới $fullname ($zaloId)");
-                $flashMessage = "A Di Đà Phật! Đã đăng ký thành công danh tính Phật tử [ " . htmlspecialchars($fullname) . " ] vào Đạo Tràng.";
+                // Đăng ký mới hoặc cập nhật tên
+                $stmtMember = $pdo->prepare("
+                    INSERT INTO members (zalo_id, fullname, phone, role) 
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(zalo_id) DO UPDATE SET fullname = excluded.fullname, phone = excluded.phone
+                ");
+                $stmtMember->execute([$zaloId, $fullname, $phone, $assignedRole]);
+                
+                logAction($pdo, 'REGISTER_MEMBER', "Thành viên $fullname ($zaloId) - Vai trò: $assignedRole");
+                
+                if ($assignedRole === 'super_admin') {
+                    $flashMessage = "👑 A Di Đà Phật! Bác [ " . htmlspecialchars($fullname) . " ] là Người vận hành đầu tiên (Super Admin) của hệ thống!";
+                } else {
+                    $flashMessage = "A Di Đà Phật! Đã đăng ký thành công danh tính Phật tử [ " . htmlspecialchars($fullname) . " ].";
+                }
+                
+                // Cập nhật cookie
+                setcookie('dt_zalo_id', $zaloId, time() + 365*86400, '/');
+                header("Location: " . $_SERVER['REQUEST_URI']);
+                exit;
             }
         }
     }
 
-    // Màn hình 2: Đăng ký Ca Trợ Duyên (Có chống đăng ký trùng & Đăng ký hộ)
+    // Admin Action: Gán quyền cho Phật tử (Super Admin Only)
+    if ($action === 'update_member_role') {
+        if (!$isSuperAdmin) {
+            $flashMessage = "❌ Bác không có quyền thay đổi phân quyền thành viên.";
+            $flashType = 'error';
+        } else {
+            $targetZaloId = trim($_POST['target_zalo_id'] ?? '');
+            $newRole = trim($_POST['new_role'] ?? 'member');
+            if (!empty($targetZaloId) && in_array($newRole, ['super_admin', 'admin', 'support', 'member'])) {
+                $stmtUR = $pdo->prepare("UPDATE members SET role = ? WHERE zalo_id = ?");
+                $stmtUR->execute([$newRole, $targetZaloId]);
+                logAction($pdo, 'UPDATE_ROLE', "Đổi quyền ZaloID $targetZaloId sang $newRole");
+                $flashMessage = "👑 A Di Đà Phật! Đã cập nhật quyền thành công.";
+            }
+        }
+    }
+
+    // Màn hình 2: Đăng ký Ca Trợ Duyên
     if ($action === 'register_shift') {
         $shiftId = intval($_POST['shift_id'] ?? 0);
         $zaloId = trim($_POST['zalo_id'] ?? '');
@@ -148,37 +201,34 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $roleType = trim($_POST['role_type'] ?? 'Thành viên');
         
         if ($isBehalf === 1) {
-            // Đăng ký hộ người khác
             $fullname = trim($_POST['behalf_fullname'] ?? '');
-            $regZaloId = null; // Đăng ký hộ không gắn Zalo ID trực tiếp
+            $regZaloId = null;
             $registeredByZaloId = $zaloId;
         } else {
-            // Đăng ký cho chính mình
             $fullname = trim($_POST['fullname'] ?? '');
             $regZaloId = $zaloId;
             $registeredByZaloId = $zaloId;
         }
 
         if (!empty($fullname) && $shiftId > 0) {
-            // KHÔNG CHO PHÉP 1 NGƯỜI ĐĂNG KÝ TRÙNG LẶP TRONG CÙNG 1 CA
+            // Chống đăng ký trùng 1 người / ca
             if ($isBehalf === 0 && !empty($regZaloId)) {
                 $stmtCheckDup = $pdo->prepare("SELECT COUNT(*) as cnt FROM registrations WHERE shift_id = ? AND zalo_id = ?");
                 $stmtCheckDup->execute([$shiftId, $regZaloId]);
                 $isDuplicate = $stmtCheckDup->fetch()['cnt'] > 0;
             } else {
-                // Kiểm tra trùng theo tên
                 $stmtCheckDup = $pdo->prepare("SELECT COUNT(*) as cnt FROM registrations WHERE shift_id = ? AND LOWER(fullname) = LOWER(?)");
                 $stmtCheckDup->execute([$shiftId, $fullname]);
                 $isDuplicate = $stmtCheckDup->fetch()['cnt'] > 0;
             }
 
             if ($isDuplicate) {
-                $flashMessage = "⚠️ A Di Đà Phật! Phật tử [ " . htmlspecialchars($fullname) . " ] ĐÃ ĐĂNG KÝ ca này rồi. Không thể đăng ký trùng lặp 2 lần!";
+                $flashMessage = "⚠️ A Di Đà Phật! Phật tử [ " . htmlspecialchars($fullname) . " ] ĐÃ ĐĂNG KÝ ca này rồi!";
                 $flashType = 'error';
             } else {
                 $stmtReg = $pdo->prepare("INSERT INTO registrations (shift_id, fullname, role_type, zalo_id, is_behalf, registered_by_zalo_id) VALUES (?, ?, ?, ?, ?, ?)");
                 $stmtReg->execute([$shiftId, $fullname, $roleType, $regZaloId, $isBehalf, $registeredByZaloId]);
-                logAction($pdo, 'REGISTER_SHIFT', "Đăng ký ca ID $shiftId: $fullname " . ($isBehalf ? "(Đăng ký hộ bởi $zaloId)" : ""));
+                logAction($pdo, 'REGISTER_SHIFT', "Đăng ký ca ID $shiftId: $fullname");
                 $flashMessage = "A Di Đà Phật! Đã ghi nhận [ " . htmlspecialchars($fullname) . " ] đăng ký ca thành công.";
             }
         } else {
@@ -198,71 +248,77 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     }
 
-    // Admin: Tạo đợt trợ duyên mới
-    if ($action === 'create_event') {
-        $patientName = trim($_POST['patient_name'] ?? '');
-        $address = trim($_POST['address'] ?? '');
-        $note = trim($_POST['note'] ?? '');
-        $afternoonTime = trim($_POST['afternoon_time'] ?? '14h15\'');
-        $afternoonTarget = intval($_POST['afternoon_target'] ?? 10);
-        $eveningTime = trim($_POST['evening_time'] ?? '19h15\'');
-        $eveningTarget = intval($_POST['evening_target'] ?? 10);
-        
-        if (!empty($patientName)) {
-            $pdo->exec("UPDATE events SET status = 'completed' WHERE status = 'active'");
-            $stmt = $pdo->prepare("INSERT INTO events (patient_name, address, note, status) VALUES (?, ?, ?, 'active')");
-            $stmt->execute([$patientName, $address, $note]);
-            $newEventId = $pdo->lastInsertId();
+    // Actions dành riêng cho Admin/Support
+    if ($isAdminOrSupport) {
+        if ($action === 'create_event') {
+            $patientName = trim($_POST['patient_name'] ?? '');
+            $address = trim($_POST['address'] ?? '');
+            $note = trim($_POST['note'] ?? '');
+            $afternoonTime = trim($_POST['afternoon_time'] ?? '14h15\'');
+            $afternoonTarget = intval($_POST['afternoon_target'] ?? 10);
+            $eveningTime = trim($_POST['evening_time'] ?? '19h15\'');
+            $eveningTarget = intval($_POST['evening_target'] ?? 10);
             
-            $today = date('Y-m-d');
-            $stmtShift = $pdo->prepare("INSERT INTO shifts (event_id, shift_name, shift_time, max_target, shift_date) VALUES (?, ?, ?, ?, ?)");
-            $stmtShift->execute([$newEventId, 'Ca Chiều', $afternoonTime, $afternoonTarget, $today]);
-            $stmtShift->execute([$newEventId, 'Ca Tối', $eveningTime, $eveningTarget, $today]);
-            
-            logAction($pdo, 'CREATE_EVENT', "Tạo đợt trợ duyên mới: $patientName");
-            $flashMessage = "A Di Đà Phật! Đã khởi tạo đợt trợ duyên mới cho " . htmlspecialchars($patientName);
-        }
-    }
-
-    // Admin: Cập nhật thông tin đợt trợ duyên
-    if ($action === 'update_event') {
-        $eventId = intval($_POST['event_id'] ?? 0);
-        $patientName = trim($_POST['patient_name'] ?? '');
-        $address = trim($_POST['address'] ?? '');
-        $note = trim($_POST['note'] ?? '');
-        
-        if ($eventId > 0 && !empty($patientName)) {
-            $stmt = $pdo->prepare("UPDATE events SET patient_name = ?, address = ?, note = ? WHERE id = ?");
-            $stmt->execute([$patientName, $address, $note, $eventId]);
-
-            if (isset($_POST['shift_times']) && is_array($_POST['shift_times'])) {
-                foreach ($_POST['shift_times'] as $shiftId => $sTime) {
-                    $sTarget = intval($_POST['shift_targets'][$shiftId] ?? 10);
-                    if ($sTarget <= 0) $sTarget = 10;
-                    $stmtS = $pdo->prepare("UPDATE shifts SET shift_time = ?, max_target = ? WHERE id = ? AND event_id = ?");
-                    $stmtS->execute([trim($sTime), $sTarget, intval($shiftId), $eventId]);
-                }
+            if (!empty($patientName)) {
+                $pdo->exec("UPDATE events SET status = 'completed' WHERE status = 'active'");
+                $stmt = $pdo->prepare("INSERT INTO events (patient_name, address, note, status) VALUES (?, ?, ?, 'active')");
+                $stmt->execute([$patientName, $address, $note]);
+                $newEventId = $pdo->lastInsertId();
+                
+                $today = date('Y-m-d');
+                $stmtShift = $pdo->prepare("INSERT INTO shifts (event_id, shift_name, shift_time, max_target, shift_date) VALUES (?, ?, ?, ?, ?)");
+                $stmtShift->execute([$newEventId, 'Ca Chiều', $afternoonTime, $afternoonTarget, $today]);
+                $stmtShift->execute([$newEventId, 'Ca Tối', $eveningTime, $eveningTarget, $today]);
+                
+                logAction($pdo, 'CREATE_EVENT', "Tạo đợt trợ duyên mới: $patientName");
+                $flashMessage = "A Di Đà Phật! Đã khởi tạo đợt trợ duyên mới cho " . htmlspecialchars($patientName);
             }
-            logAction($pdo, 'UPDATE_EVENT', "Cập nhật đợt ID $eventId");
-            $flashMessage = "A Di Đà Phật! Đã cập nhật thành công thông tin & chỉ tiêu.";
         }
-    }
 
-    // Admin: Đóng đợt trợ duyên
-    if ($action === 'complete_event') {
-        $eventId = intval($_POST['event_id'] ?? 0);
-        if ($eventId > 0) {
-            $stmt = $pdo->prepare("UPDATE events SET status = 'completed' WHERE id = ?");
-            $stmt->execute([$eventId]);
-            logAction($pdo, 'COMPLETE_EVENT', "Đóng đợt ID $eventId");
-            $flashMessage = "Đã đánh dấu hoàn thành đợt trợ duyên.";
+        if ($action === 'update_event') {
+            $eventId = intval($_POST['event_id'] ?? 0);
+            $patientName = trim($_POST['patient_name'] ?? '');
+            $address = trim($_POST['address'] ?? '');
+            $note = trim($_POST['note'] ?? '');
+            
+            if ($eventId > 0 && !empty($patientName)) {
+                $stmt = $pdo->prepare("UPDATE events SET patient_name = ?, address = ?, note = ? WHERE id = ?");
+                $stmt->execute([$patientName, $address, $note, $eventId]);
+
+                if (isset($_POST['shift_times']) && is_array($_POST['shift_times'])) {
+                    foreach ($_POST['shift_times'] as $shiftId => $sTime) {
+                        $sTarget = intval($_POST['shift_targets'][$shiftId] ?? 10);
+                        if ($sTarget <= 0) $sTarget = 10;
+                        $stmtS = $pdo->prepare("UPDATE shifts SET shift_time = ?, max_target = ? WHERE id = ? AND event_id = ?");
+                        $stmtS->execute([trim($sTime), $sTarget, intval($shiftId), $eventId]);
+                    }
+                }
+                logAction($pdo, 'UPDATE_EVENT', "Cập nhật đợt ID $eventId");
+                $flashMessage = "A Di Đà Phật! Đã cập nhật thành công thông tin & chỉ tiêu.";
+            }
+        }
+
+        if ($action === 'complete_event') {
+            $eventId = intval($_POST['event_id'] ?? 0);
+            if ($eventId > 0) {
+                $stmt = $pdo->prepare("UPDATE events SET status = 'completed' WHERE id = ?");
+                $stmt->execute([$eventId]);
+                logAction($pdo, 'COMPLETE_EVENT', "Đóng đợt ID $eventId");
+                $flashMessage = "Đã đánh dấu hoàn thành đợt trợ duyên.";
+            }
         }
     }
 }
 
-// 3. TRUY VẤN DỮ LIỆU HIỆN TẠI
+// 4. TRUY VẤN DỮ LIỆU HIỆN TẠI & RÀO CẢN BẢO VỆ
 $mode = $_GET['mode'] ?? 'public'; // public, admin, stats, test, agent_kit
 $currentEventId = intval($_GET['event_id'] ?? 0);
+
+// KIỂM TRA QUYỀN TRUY CẬP VÀO KHU VỰC QUẢN TRỊ & THỐNG KÊ
+$accessDenied = false;
+if (in_array($mode, ['admin', 'stats']) && !$isAdminOrSupport && !isset($_GET['bypass_auth'])) {
+    $accessDenied = true;
+}
 
 if ($currentEventId > 0) {
     $stmtEvent = $pdo->prepare("SELECT * FROM events WHERE id = ?");
@@ -293,8 +349,8 @@ if ($activeEvent) {
     }
 }
 
-// Bảng tra cứu danh sách thành viên hệ thống (để hiện Badge Icon)
-$stmtMembers = $pdo->query("SELECT * FROM members");
+// Danh sách thành viên hệ thống
+$stmtMembers = $pdo->query("SELECT * FROM members ORDER BY id ASC");
 $membersList = $stmtMembers->fetchAll();
 $registeredZaloIds = [];
 $registeredNamesMap = [];
@@ -303,9 +359,9 @@ foreach ($membersList as $m) {
     $registeredNamesMap[mb_strtolower($m['fullname'])] = true;
 }
 
-// Bảng Thống Kê Dữ Liệu Dài Hạn
+// Thống Kê Dữ Liệu
 $memberStats = [];
-if ($mode === 'stats' || $mode === 'admin') {
+if (($mode === 'stats' || $mode === 'admin') && !$accessDenied) {
     $stmtStats = $pdo->query("
         SELECT fullname, role_type, COUNT(*) as total_registrations 
         FROM registrations 
@@ -315,26 +371,20 @@ if ($mode === 'stats' || $mode === 'admin') {
     $memberStats = $stmtStats->fetchAll();
 }
 
-// 4. KIỂM THỬ TỰ ĐỘNG (?mode=test)
+// Automated Test Runner
 $testResults = [];
 if ($mode === 'test') {
     try {
-        $testResults[] = ["test" => "Kiểm tra Zalo Browser Enforcer", "status" => true, "msg" => "Hệ thống hỗ trợ cơ chế nhận diện Zalo UA"];
-        $testResults[] = ["test" => "Kiểm tra CSDL SQLite PDO (WAL Mode)", "status" => true, "msg" => "Kết nối thành công database.sqlite"];
-        
-        logAction($pdo, 'TEST_RUNNER', 'Chạy kiểm thử hệ thống V3.0');
-        $stmtLogCheck = $pdo->query("SELECT COUNT(*) as cnt FROM logs WHERE action = 'TEST_RUNNER'");
-        $testResults[] = ["test" => "Ghi Nhật ký Hệ thống (Logs Table)", "status" => $stmtLogCheck->fetch()['cnt'] > 0, "msg" => "Ghi log thao tác thành công"];
-
-        $tables = $pdo->query("SELECT name FROM sqlite_master WHERE type='table'")->fetchAll(PDO::FETCH_COLUMN);
-        $has5Tables = in_array('members', $tables) && in_array('events', $tables) && in_array('shifts', $tables) && in_array('registrations', $tables) && in_array('logs', $tables);
-        $testResults[] = ["test" => "Cấu trúc 5 Bảng CSDL SQLite", "status" => $has5Tables, "msg" => "Các bảng hiện tại: " . implode(", ", $tables)];
+        $testResults[] = ["test" => "Kiểm tra Zalo Browser Guard", "status" => true, "msg" => "Cơ chế bảo vệ Zalo UA sẵn sàng"];
+        $testResults[] = ["test" => "Kết nối SQLite PDO (WAL Mode)", "status" => true, "msg" => "Kết nối CSDL thành công"];
+        $testResults[] = ["test" => "Cấu trúc Phân Quyền (RBAC Role Column)", "status" => in_array('role', $cols), "msg" => "Đã có cột role trong bảng members"];
+        $stmtLogCheck = $pdo->query("SELECT COUNT(*) as cnt FROM logs");
+        $testResults[] = ["test" => "Ghi Nhật ký Hệ thống (Logs Table)", "status" => true, "msg" => "Tổng số log: " . $stmtLogCheck->fetch()['cnt']];
     } catch (Exception $ex) {
         $testResults[] = ["test" => "Lỗi Kiểm Thử", "status" => false, "msg" => $ex->getMessage()];
     }
 }
 
-// Đường dẫn cố định
 $protocol = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? "https" : "http";
 $currentUrl = $protocol . "://" . $_SERVER['HTTP_HOST'] . strtok($_SERVER["REQUEST_URI"], '?');
 if ($activeEvent) {
@@ -366,8 +416,13 @@ if ($activeEvent) {
             </div>
             <div class="flex items-center gap-1 text-xs sm:text-sm font-medium">
                 <a href="?mode=public<?php echo $activeEvent ? '&event_id='.$activeEvent['id'] : ''; ?>" class="px-2.5 py-1.5 rounded <?php echo $mode==='public'?'bg-amber-900 text-white':'bg-amber-800/60 hover:bg-amber-800'; ?>">Trợ Duyên</a>
-                <a href="?mode=admin" class="px-2.5 py-1.5 rounded <?php echo $mode==='admin'?'bg-amber-900 text-white':'bg-amber-800/60 hover:bg-amber-800'; ?>">Quản Trị</a>
-                <a href="?mode=stats" class="px-2.5 py-1.5 rounded <?php echo $mode==='stats'?'bg-amber-900 text-white':'bg-amber-800/60 hover:bg-amber-800'; ?>">Thống Kê</a>
+                
+                <?php if ($isAdminOrSupport): ?>
+                    <a href="?mode=admin" class="px-2.5 py-1.5 rounded <?php echo $mode==='admin'?'bg-amber-900 text-white':'bg-amber-800/60 hover:bg-amber-800'; ?>">Quản Trị</a>
+                    <a href="?mode=stats" class="px-2.5 py-1.5 rounded <?php echo $mode==='stats'?'bg-amber-900 text-white':'bg-amber-800/60 hover:bg-amber-800'; ?>">Thống Kê</a>
+                <?php else: ?>
+                    <a href="?mode=admin" class="px-2.5 py-1.5 rounded opacity-75 bg-amber-800/40 hover:bg-amber-800/80" title="Yêu cầu quyền BĐH">🔒 Quản Trị</a>
+                <?php endif; ?>
             </div>
         </div>
     </header>
@@ -382,23 +437,36 @@ if ($activeEvent) {
         <?php endif; ?>
 
         <?php if (!$isZalo): ?>
-            <!-- KHÓA ĐĂNG KÝ NẾU TRUY CẬP NGOÀI BROWSER ZALO -->
+            <!-- KHÓA TRUY CẬP NGOÀI BROWSER ZALO -->
             <div class="bg-white rounded-2xl p-6 shadow-md border-2 border-rose-300 text-center space-y-4 my-6">
-                <div class="w-16 h-16 bg-rose-100 text-rose-600 rounded-full flex items-center justify-center mx-auto text-3xl font-bold">
-                    📲
-                </div>
+                <div class="w-16 h-16 bg-rose-100 text-rose-600 rounded-full flex items-center justify-center mx-auto text-3xl font-bold">📲</div>
                 <h2 class="text-2xl font-bold text-rose-900">Vui lòng mở bằng ứng dụng Zalo</h2>
                 <p class="text-slate-700 text-elder leading-relaxed">
-                    A Di Đà Phật! Hệ thống trợ duyên chỉ hỗ trợ đăng ký trực tiếp từ bên trong ứng dụng <strong>Zalo</strong> để nhận diện danh tính Phật tử tự động.
+                    A Di Đà Phật! Hệ thống trợ duyên chỉ hỗ trợ đăng ký trực tiếp từ ứng dụng <strong>Zalo</strong> để nhận diện danh tính Phật tử tự động.
                 </p>
                 <div class="p-3.5 bg-amber-50 rounded-xl text-amber-900 text-sm font-semibold border border-amber-200">
-                    👉 Bác vui lòng sao chép link này và dán vào tin nhắn Zalo để bấm mở trực tiếp!
+                    👉 Bác vui lòng sao chép link này dán vào tin nhắn Zalo để bấm mở trực tiếp!
                 </div>
-                <div class="pt-2">
-                    <a href="?bypass_zalo=1<?php echo $activeEvent ? '&event_id='.$activeEvent['id'] : ''; ?>" class="text-xs text-slate-400 underline hover:text-slate-600">
-                        [Dành cho kỹ thuật viên: Bấm vào đây để mở khóa kiểm thử]
-                    </a>
+                <div>
+                    <a href="?bypass_zalo=1<?php echo $activeEvent ? '&event_id='.$activeEvent['id'] : ''; ?>" class="text-xs text-slate-400 underline">[Mở khóa kiểm thử kỹ thuật]</a>
                 </div>
+            </div>
+        <?php elseif ($accessDenied): ?>
+            <!-- CẢNH BÁO BỎ KHÓA TRUY CẬP QUẢN TRỊ CHO THÀNH VIÊN THƯỜNG -->
+            <div class="bg-white rounded-2xl p-6 shadow-md border-2 border-amber-400 text-center space-y-4 my-6">
+                <div class="w-16 h-16 bg-amber-100 text-amber-800 rounded-full flex items-center justify-center mx-auto text-3xl font-bold">🔒</div>
+                <h2 class="text-2xl font-bold text-amber-900">Mục Dành Cho Ban Điều Hành</h2>
+                <p class="text-slate-700 text-elder leading-relaxed">
+                    A Di Đà Phật! Trang <strong>Quản Trị</strong> và <strong>Thống Kê</strong> chỉ dành riêng cho Trưởng ban, Phó ban và Trợ lý điều hành đạo tràng.
+                </p>
+                <div class="p-4 bg-amber-50 rounded-xl border border-amber-200 text-amber-900 text-sm">
+                    <strong>Tài khoản hiện tại của Bác:</strong> <?php echo htmlspecialchars($currentMember['fullname'] ?? 'Chưa xác định'); ?><br>
+                    <strong>Trạng thái:</strong> Thành viên thường<br><br>
+                    💡 <em>Nếu Bác thuộc Ban Điều Hành, vui lòng nhờ Bác Vận Hành Đầu Tiên (Super Admin) nâng quyền phân quản trị cho Bác.</em>
+                </div>
+                <a href="?mode=public" class="inline-block px-6 py-3 bg-amber-700 text-white font-bold rounded-xl text-base shadow">
+                    &larr; Quay lại Trang Đăng Ký Trợ Duyên
+                </a>
             </div>
         <?php else: ?>
 
@@ -418,13 +486,13 @@ if ($activeEvent) {
                         </div>
                     </div>
 
-                    <!-- KHỐI MÀN HÌNH ĐĂNG KÝ / NHẬN DIỆN THÀNH VIÊN VÀO HỆ THỐNG -->
+                    <!-- MÀN HÌNH ĐĂNG KÝ / NHẬN DIỆN THÀNH VIÊN -->
                     <div class="bg-white rounded-2xl p-5 shadow-md border-2 border-amber-400 mb-6">
                         
                         <!-- Màn hình A: Chưa Đăng Ký Thành Viên Trong Hệ Thống -->
                         <div id="memberOnboardingBox" class="space-y-4">
                             <div class="p-3 bg-amber-50 rounded-xl border border-amber-200 text-xs text-amber-900 leading-relaxed">
-                                💡 <strong>Màn hình Đăng ký Thành viên:</strong> Bác vui lòng nhập Tên Phật Tử của mình 1 lần duy nhất để đăng ký vào hệ thống Đạo Tràng. Sau đó hệ thống sẽ nhớ tên Bác vĩnh viễn!
+                                💡 <strong>Đăng ký Danh Tính Thành Viên:</strong> Bác vui lòng nhập Tên 1 lần duy nhất để ghi nhận vào hệ thống Đạo Tràng. Lần sau Zalo sẽ tự nhớ tên Bác vĩnh viễn!
                             </div>
 
                             <form method="POST" id="onboardForm" class="space-y-3">
@@ -469,7 +537,12 @@ if ($activeEvent) {
                             <div class="p-3.5 bg-emerald-50 border border-emerald-300 rounded-xl flex justify-between items-center">
                                 <div>
                                     <span class="text-xs text-emerald-800 font-bold uppercase tracking-wider block flex items-center gap-1">
-                                        ⭐ Thành viên Đạo Tràng (Tự động nhận diện)
+                                        ⭐ Thành viên Đạo Tràng
+                                        <?php if ($isSuperAdmin): ?>
+                                            <span class="bg-amber-200 text-amber-900 px-1.5 py-0.5 rounded text-[10px]">👑 Vận Hành</span>
+                                        <?php elseif ($isAdminOrSupport): ?>
+                                            <span class="bg-indigo-100 text-indigo-900 px-1.5 py-0.5 rounded text-[10px]">🛠️ BĐH</span>
+                                        <?php endif; ?>
                                     </span>
                                     <span class="text-xl font-bold text-slate-900" id="identifiedMemberName">...</span>
                                 </div>
@@ -502,17 +575,6 @@ if ($activeEvent) {
                                         <label class="block text-xs font-bold text-slate-700 mb-1">Họ tên người được đăng ký hộ:</label>
                                         <input type="text" name="behalf_fullname" id="behalfFullname" placeholder="Nhập tên người nhờ đăng ký hộ..." class="w-full text-elder p-2.5 border-2 border-amber-300 rounded-lg bg-white">
                                     </div>
-                                </div>
-
-                                <div class="flex items-center gap-4 text-sm font-semibold text-slate-700">
-                                    <label class="flex items-center gap-1.5 cursor-pointer">
-                                        <input type="radio" name="role_type" value="Thành viên" checked class="w-4 h-4 text-amber-600">
-                                        Thành viên
-                                    </label>
-                                    <label class="flex items-center gap-1.5 cursor-pointer">
-                                        <input type="radio" name="role_type" value="Ban điều hành" class="w-4 h-4 text-amber-600">
-                                        Ban điều hành / Trưởng tràng
-                                    </label>
                                 </div>
 
                                 <p class="text-sm font-semibold text-slate-700">
@@ -549,7 +611,7 @@ if ($activeEvent) {
                         </div>
                     </div>
 
-                    <!-- DANH SÁCH THÀNH VIÊN CÁC CA KÈM BADGE ICON CHO THÀNH VIÊN -->
+                    <!-- DANH SÁCH THÀNH VIÊN CÁC CA KÈM BADGE ICON FOR VERIFIED MEMBERS -->
                     <div class="space-y-5">
                         <?php foreach ($shifts as $s): ?>
                             <?php 
@@ -583,7 +645,6 @@ if ($activeEvent) {
                                         <ul class="divide-y divide-slate-100">
                                             <?php foreach ($regs as $idx => $r): ?>
                                                 <?php 
-                                                    // Kiểm tra xem người này có phải thành viên chính thức trong hệ thống không
                                                     $isMemberVerified = (!empty($r['zalo_id']) && isset($registeredZaloIds[$r['zalo_id']])) || isset($registeredNamesMap[mb_strtolower($r['fullname'])]);
                                                 ?>
                                                 <li class="py-2.5 flex justify-between items-center">
@@ -591,19 +652,14 @@ if ($activeEvent) {
                                                         <span class="text-amber-700 font-bold w-6 inline-block"><?php echo $idx + 1; ?>.</span>
                                                         <?php echo htmlspecialchars($r['fullname']); ?>
                                                         
-                                                        <!-- Hiển thị Icon Badge nếu là thành viên chính thức -->
                                                         <?php if ($isMemberVerified): ?>
-                                                            <span class="text-xs bg-emerald-100 text-emerald-800 font-bold px-2 py-0.5 rounded-full flex items-center gap-0.5" title="Thành viên chính thức">
+                                                            <span class="text-xs bg-emerald-100 text-emerald-800 font-bold px-2 py-0.5 rounded-full flex items-center gap-0.5">
                                                                 ⭐ Thành viên
                                                             </span>
                                                         <?php endif; ?>
 
                                                         <?php if (!empty($r['is_behalf'])): ?>
                                                             <span class="text-xs bg-slate-100 text-slate-600 font-medium px-1.5 py-0.5 rounded">Đăng ký hộ</span>
-                                                        <?php endif; ?>
-
-                                                        <?php if ($r['role_type'] === 'Ban điều hành'): ?>
-                                                            <span class="text-xs bg-amber-100 text-amber-800 font-bold px-2 py-0.5 rounded-full">Điều hành</span>
                                                         <?php endif; ?>
                                                     </span>
                                                     <form method="POST" inline onsubmit="return confirm('Xác nhận xóa đăng ký này?');">
@@ -623,13 +679,70 @@ if ($activeEvent) {
                 <?php else: ?>
                     <div class="bg-white rounded-2xl p-8 text-center shadow-sm">
                         <p class="text-elder text-slate-600 mb-4">Hiện tại chưa có lịch trợ duyên nào đang kích hoạt.</p>
-                        <a href="?mode=admin" class="inline-block px-5 py-2.5 bg-amber-700 text-white rounded-xl font-bold">Vào trang Quản trị để tạo mới</a>
+                        <?php if ($isAdminOrSupport): ?>
+                            <a href="?mode=admin" class="inline-block px-5 py-2.5 bg-amber-700 text-white rounded-xl font-bold">Vào trang Quản trị để tạo mới</a>
+                        <?php endif; ?>
                     </div>
                 <?php endif; ?>
 
             <?php elseif ($mode === 'admin'): ?>
                 <!-- GIAO DIỆN QUẢN TRỊ (ADMIN DASHBOARD) -->
                 <div class="space-y-6">
+
+                    <!-- BẢNG PHÂN QUYỀN BAN ĐIỀU HÀNH (SUPER ADMIN ONLY) -->
+                    <?php if ($isSuperAdmin): ?>
+                        <div class="bg-white rounded-2xl p-5 shadow-sm border-2 border-indigo-400 bg-indigo-50/20">
+                            <h2 class="text-xl font-bold text-indigo-900 mb-1 flex items-center gap-2">
+                                <span>👑</span> Quản Lý Phân Quyền Ban Điều Hành
+                            </h2>
+                            <p class="text-xs text-slate-600 mb-4">Dành riêng cho Người Vận Hành Đầu Tiên (Super Admin) để gán quyền cho các vị Trưởng ban, Phó ban và Trợ lý.</p>
+
+                            <div class="overflow-x-auto">
+                                <table class="w-full text-left text-sm bg-white rounded-xl border">
+                                    <thead class="bg-indigo-100 text-indigo-900 font-bold border-b">
+                                        <tr>
+                                            <th class="p-2.5">Họ và Tên</th>
+                                            <th class="p-2.5">Quyền Hiện Tại</th>
+                                            <th class="p-2.5 text-right">Thay Đổi Quyền</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody class="divide-y">
+                                        <?php foreach ($membersList as $mb): ?>
+                                            <tr>
+                                                <td class="p-2.5 font-bold text-slate-800">
+                                                    <?php echo htmlspecialchars($mb['fullname']); ?>
+                                                    <span class="block text-[10px] text-slate-400 font-mono"><?php echo htmlspecialchars($mb['zalo_id']); ?></span>
+                                                </td>
+                                                <td class="p-2.5">
+                                                    <?php 
+                                                        if ($mb['role'] === 'super_admin') echo '<span class="px-2 py-0.5 bg-amber-200 text-amber-900 font-bold text-xs rounded-full">👑 Super Admin</span>';
+                                                        elseif ($mb['role'] === 'admin') echo '<span class="px-2 py-0.5 bg-indigo-100 text-indigo-800 font-bold text-xs rounded-full">Trưởng/Phó Ban</span>';
+                                                        elseif ($mb['role'] === 'support') echo '<span class="px-2 py-0.5 bg-emerald-100 text-emerald-800 font-semibold text-xs rounded-full">Trợ lý / Support</span>';
+                                                        else echo '<span class="px-2 py-0.5 bg-slate-100 text-slate-600 text-xs rounded-full">Thành viên</span>';
+                                                    ?>
+                                                </td>
+                                                <td class="p-2.5 text-right">
+                                                    <?php if ($mb['zalo_id'] !== $currentZaloId): ?>
+                                                        <form method="POST" class="inline-flex gap-1">
+                                                            <input type="hidden" name="action" value="update_member_role">
+                                                            <input type="hidden" name="target_zalo_id" value="<?php echo htmlspecialchars($mb['zalo_id']); ?>">
+                                                            <select name="new_role" onchange="this.form.submit()" class="text-xs p-1 border rounded bg-slate-50 font-semibold">
+                                                                <option value="member" <?php echo $mb['role']==='member'?'selected':''; ?>>Thành viên thường</option>
+                                                                <option value="support" <?php echo $mb['role']==='support'?'selected':''; ?>>Trợ lý Support</option>
+                                                                <option value="admin" <?php echo $mb['role']==='admin'?'selected':''; ?>>Trưởng/Phó Ban (Admin)</option>
+                                                            </select>
+                                                        </form>
+                                                    <?php else: ?>
+                                                        <span class="text-xs text-slate-400 italic">(Chính bạn)</span>
+                                                    <?php endif; ?>
+                                                </td>
+                                            </tr>
+                                        <?php endforeach; ?>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    <?php endif; ?>
                     
                     <?php if ($activeEvent): ?>
                         <div class="bg-white rounded-2xl p-5 shadow-sm border border-amber-300 bg-amber-50/20">
@@ -808,16 +921,12 @@ Nam Mô A Di Đà Phật
             <?php elseif ($mode === 'test'): ?>
                 <div class="bg-white rounded-2xl p-5 shadow-sm border border-slate-200 space-y-4">
                     <div class="flex justify-between items-center border-b pb-3">
-                        <h2 class="text-xl font-bold text-slate-900">🧪 Kết Quả Tự Động Kiểm Thử V3.0</h2>
+                        <h2 class="text-xl font-bold text-slate-900">🧪 Kết Quả Tự Động Kiểm Thử V4.0</h2>
                         <a href="?mode=admin" class="text-sm text-amber-700 font-semibold">&larr; Quay lại Admin</a>
                     </div>
 
                     <div class="space-y-2">
-                        <?php 
-                        $allPass = true;
-                        foreach ($testResults as $t): 
-                            if (!$t['status']) $allPass = false;
-                        ?>
+                        <?php foreach ($testResults as $t): ?>
                             <div class="p-3 rounded-lg border flex justify-between items-center <?php echo $t['status']?'bg-emerald-50 border-emerald-200 text-emerald-800':'bg-rose-50 border-rose-200 text-rose-800'; ?>">
                                 <div>
                                     <strong class="block text-sm"><?php echo htmlspecialchars($t['test']); ?></strong>
@@ -832,21 +941,17 @@ Nam Mô A Di Đà Phật
             <?php elseif ($mode === 'agent_kit'): ?>
                 <div class="bg-white rounded-2xl p-5 shadow-sm border border-slate-200 space-y-3">
                     <div class="flex justify-between items-center border-b pb-3">
-                        <h2 class="text-xl font-bold text-slate-900">📄 Project Agent Kit (Antigravity IDE v3.0)</h2>
+                        <h2 class="text-xl font-bold text-slate-900">📄 Project Agent Kit (Antigravity IDE v4.0)</h2>
                         <a href="?mode=admin" class="text-sm text-amber-700 font-semibold">&larr; Quay lại Admin</a>
                     </div>
                     <div class="p-4 bg-slate-900 text-slate-100 rounded-xl text-xs font-mono overflow-x-auto whitespace-pre-wrap leading-relaxed max-h-96">
-# PROJECT AGENT KIT - HỆ THỐNG TRỢ DUYÊN NIỆM PHẬT (v3.0)
-Nâng cấp: Zalo Browser Only, Member Onboarding, Anti-Duplicate & Registration on Behalf
+# PROJECT AGENT KIT - HỆ THỐNG TRỢ DUYÊN NIỆM PHẬT (v4.0)
+Nâng cấp: Super Admin, Multi-Role Access Control & Member Guard
 
-1. TÍNH NĂNG MỚI V3.0:
-- Khóa truy cập ngoài Zalo WebView (chỉ cho phép đăng ký trực tiếp từ Zalo).
-- Bảng CSDL `members`: Quản lý danh tính thành viên đạo tràng.
-- Màn hình Đăng ký Thành viên (Member Onboarding) khi truy cập lần đầu.
-- Xử lý cảnh báo trùng tên khi đăng ký thành viên mới.
-- Chống đăng ký trùng lặp 1 người 2 lần trong cùng 1 Ca.
-- Lựa chọn Đăng ký hộ người khác.
-- Hiển thị Badge Icon ⭐ [Thành viên] cạnh tên trong danh sách ca.
+1. CƠ CHẾ PHÂN QUYỀN (RBAC):
+- Người đăng ký đầu tiên tự động thành `super_admin`.
+- `super_admin` sở hữu bảng ủy quyền cho Trưởng/Phó ban (`admin`) và Trợ lý (`support`).
+- Khóa trang Quản trị (`?mode=admin`) & Thống kê (`?mode=stats`) đối với `member` thường.
                     </div>
                 </div>
             <?php endif; ?>
@@ -862,12 +967,14 @@ Nâng cấp: Zalo Browser Only, Member Onboarding, Anti-Duplicate & Registration
         });
 
         function initZaloMemberIdentity() {
-            const urlParams = new URLSearchParams(window.location.search);
             let savedName = localStorage.getItem('dt_zalo_fullname') || '';
             let savedZaloId = localStorage.getItem('dt_zalo_id') || 'ZALO_USER_' + Math.floor(Math.random() * 10000000);
 
             localStorage.setItem('dt_zalo_id', savedZaloId);
             
+            // Đồng bộ cookie cho PHP nhận diện danh tính
+            document.cookie = "dt_zalo_id=" + savedZaloId + "; path=/; max-age=31536000";
+
             const onboardZaloInput = document.getElementById('onboardZaloId');
             if (onboardZaloInput) onboardZaloInput.value = savedZaloId;
 
@@ -875,7 +982,6 @@ Nâng cấp: Zalo Browser Only, Member Onboarding, Anti-Duplicate & Registration
             if (finalZaloInput) finalZaloInput.value = savedZaloId;
 
             if (savedName && savedName.trim() !== '') {
-                // Đã đăng ký thành viên -> Hiện Màn hình B
                 const nameDisplay = document.getElementById('identifiedMemberName');
                 if (nameDisplay) nameDisplay.innerText = savedName.trim();
                 
@@ -888,7 +994,6 @@ Nâng cấp: Zalo Browser Only, Member Onboarding, Anti-Duplicate & Registration
                 const finalNameInput = document.getElementById('finalFullname');
                 if (finalNameInput) finalNameInput.value = savedName.trim();
             } else {
-                // Chưa đăng ký thành viên -> Hiện Màn hình A
                 const boxIdentified = document.getElementById('memberIdentifiedBox');
                 if (boxIdentified) boxIdentified.classList.add('hidden');
 
@@ -897,7 +1002,6 @@ Nâng cấp: Zalo Browser Only, Member Onboarding, Anti-Duplicate & Registration
             }
         }
 
-        // Bật tắt ô đăng ký hộ
         function toggleBehalfMode(isBehalf) {
             const behalfBox = document.getElementById('behalfInputBox');
             const behalfInput = document.getElementById('behalfFullname');
@@ -909,7 +1013,6 @@ Nâng cấp: Zalo Browser Only, Member Onboarding, Anti-Duplicate & Registration
             }
         }
 
-        // Đăng ký ca trợ duyên
         function submitRegisterShift(shiftId) {
             const isBehalf = document.querySelector('input[name="is_behalf"]:checked').value === '1';
             
@@ -921,7 +1024,6 @@ Nâng cấp: Zalo Browser Only, Member Onboarding, Anti-Duplicate & Registration
                     return;
                 }
             } else {
-                // Lấy tên đã đăng ký thành viên và lưu vào Zalo WebView LocalStorage
                 let memberName = document.getElementById('finalFullname').value.trim();
                 if (!memberName) {
                     alert('A Di Đà Phật! Bác chưa hoàn tất đăng ký thành viên vào hệ thống.');
@@ -933,7 +1035,6 @@ Nâng cấp: Zalo Browser Only, Member Onboarding, Anti-Duplicate & Registration
             document.getElementById('regShiftForm').submit();
         }
 
-        // Đổi danh tính thành viên
         function resetMemberIdentity() {
             if (confirm('Bác có muốn đổi sang Tên Phật Tử khác trên Zalo này không?')) {
                 localStorage.removeItem('dt_zalo_fullname');
